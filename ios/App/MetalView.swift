@@ -12,8 +12,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
 
     // Hooks the view controller fills in.
-    var onOpenDialog: ((Bool) -> Void)?
-    var onExport: ((String) -> Void)?
+    var onOpenDialog: ((_ multiple: Bool, _ pictures: Bool) -> Void)?
+    var onSaveDialog: ((String) -> Void)?
     var onOpenURL: ((String) -> Void)?
     var onCopyText: ((String) -> Void)?
     /// True while a picker or alert is showing, so the view doesn't grab the keyboard back.
@@ -39,15 +39,37 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     /// How long after the Pencil leaves that fingers are still ignored.
     private let palmGrace: CFTimeInterval = 0.45
     private var eraserOn = false
+    private var lastHover = CGPoint(x: 200, y: 200)
+    private var hoverLogged = 0
+    private var keyLogged = 0
 
-    // Fingers: one finger acts like the pointer, two or more are gestures.
+    // Pencil samples wait a moment for iPadOS to deliver their true pressure.
+    private struct PenItem {
+        var phase: Int32
+        var location: CGPoint
+        var force: CGFloat
+        var altitude: CGFloat
+        var azimuth: CGVector
+        var roll: CGFloat
+        var mods: UInt32
+        var index: NSNumber?
+        var ready: Bool
+        var time: CFTimeInterval
+    }
+    private var penQueue: [PenItem] = []
+    private var smoothedPressure: Float = 0
+    private static let pressureKey = "PhotoCraftPressureDivisor"
+    /// The force (1.0 is an average touch) that counts as full pressure. Lower is more sensitive.
+    private var pressureDivisor: CGFloat = 2.5
+
+    // Fingers: one finger is decided on by the Rust side (tap, scroll, pan or draw);
+    // two or more fingers are gestures.
     private var directTouches = Set<UITouch>()
     private var ignoredTouches = Set<UITouch>()
     private var fingerTouch: UITouch?
-    private var fingerStart = CGPoint.zero
-    private var fingerStartTime: TimeInterval = 0
-    private var fingerPressed = false
-    private var longPressFired = false
+    private var fingerLast = CGPoint.zero
+    private var fingerDraws = false
+    private static let fingerKey = "PhotoCraftFingerDraws"
 
     /// True while the Pencil is touching, hovering, or has only just left the screen.
     private var pencilNear: Bool {
@@ -126,6 +148,10 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let saved = UserDefaults.standard.float(forKey: MetalView.scaleKey)
             uiScale = saved > 0 ? saved : autoScale()
             pc_set_ui_scale(handle, uiScale)
+            let d = UserDefaults.standard.double(forKey: MetalView.pressureKey)
+            if d > 0 { pressureDivisor = CGFloat(d) }
+            fingerDraws = UserDefaults.standard.bool(forKey: MetalView.fingerKey)
+            pc_set_finger_draw(handle, fingerDraws ? 1 : 0)
         }
     }
 
@@ -133,7 +159,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private func autoScale() -> Float {
         let size = window?.windowScene?.screen.bounds.size ?? CGSize(width: 834, height: 1194)
         let short = Float(min(size.width, size.height))
-        return max(1.15, min(1.5, 1.15 + (1100 - short) / 1000))
+        return max(1.5, min(1.9, 1.55 + (1100 - short) / 1200))
     }
 
     /// Larger or smaller interface (⌘⌃= and ⌘⌃−), or back to the automatic size.
@@ -161,6 +187,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard let h = handle else { return }
         if !suspendFocus && !isFirstResponder { _ = becomeFirstResponder() }
         repeatHeldKey()
+        flushPen(all: false)
         let flags = pc_frame(h)
         let wants = (flags & 2) != 0
         if wants != softKeyboard {
@@ -179,14 +206,19 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         let me = Unmanaged.passUnretained(self).toOpaque()
         return PCCallbacks(
             user: me,
-            open_dialog: { u, multiple in
+            open_dialog: { u, multiple, pictures in
                 guard let v = MetalView.from(u) else { return }
-                DispatchQueue.main.async { v.onOpenDialog?(multiple != 0) }
+                DispatchQueue.main.async { v.onOpenDialog?(multiple != 0, pictures != 0) }
             },
-            export_file: { u, path in
-                guard let v = MetalView.from(u), let path = path else { return }
-                let s = String(cString: path)
-                DispatchQueue.main.async { v.onExport?(s) }
+            save_dialog: { u, name in
+                guard let v = MetalView.from(u), let name = name else { return }
+                let s = String(cString: name)
+                DispatchQueue.main.async { v.onSaveDialog?(s) }
+            },
+            write_file: { _, path, data, len in
+                guard let path = path, let data = data else { return 0 }
+                let bytes = Data(bytes: data, count: len)
+                return FileAccess.shared.write(path: String(cString: path), data: bytes) ? 1 : 0
             },
             open_url: { u, url in
                 guard let v = MetalView.from(u), let url = url else { return }
@@ -213,9 +245,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         }
     }
 
-    /// The Open sheet finished with these files (or none, when cancelled).
-    func deliverDialog(files: [(String, Data)], ok: Bool) {
+    /// The Open sheet finished: files copied in (Photos, several files), or files opened in place
+    /// (their paths), or nothing when cancelled.
+    func deliverDialog(files: [(String, Data)], paths: [String], ok: Bool) {
         guard let h = handle else { return }
+        for path in paths { path.withCString { pc_dialog_path(h, $0) } }
         for (name, data) in files {
             name.withCString { n in
                 data.withUnsafeBytes { raw in
@@ -224,6 +258,33 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             }
         }
         pc_dialog_end(h, ok ? 1 : 0)
+    }
+
+    /// The Save to Files sheet finished: the place chosen, or nil when cancelled.
+    func deliverSaveDialog(path: String?) {
+        guard let h = handle else { return }
+        if let path = path { path.withCString { pc_save_dialog_end(h, $0) } } else { pc_save_dialog_end(h, nil) }
+    }
+
+    // MARK: Buttons for the on-screen bar
+
+    func undo() { tapKey(0x1D, mods: 8) }          // ⌘Z
+    func redo() { tapKey(0x1D, mods: 8 | 1) }      // ⇧⌘Z
+    func fitOnScreen() { tapKey(0x27, mods: 8) }   // ⌘0
+
+    var fingersDraw: Bool { fingerDraws }
+
+    func setFingersDraw(_ on: Bool) {
+        fingerDraws = on
+        UserDefaults.standard.set(on, forKey: MetalView.fingerKey)
+        if let h = handle { pc_set_finger_draw(h, on ? 1 : 0) }
+    }
+
+    /// Softer (negative) or firmer (positive) Pencil response.
+    func adjustPressure(by step: CGFloat, reset: Bool = false) {
+        if reset { pressureDivisor = 2.5 } else { pressureDivisor = max(1.2, min(4.2, pressureDivisor - step)) }
+        UserDefaults.standard.set(Double(pressureDivisor), forKey: MetalView.pressureKey)
+        pcLog("pencil: full pressure at force \(pressureDivisor)")
     }
 
     // MARK: Keyboard
@@ -297,6 +358,10 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         let hid = UInt32(key.keyCode.rawValue)
         if hid >= 0xE0 && hid <= 0xE7 { return true }   // a modifier key on its own
         let mods = modBits(key.modifierFlags)
+        if down && keyLogged < 20 {
+            keyLogged += 1
+            pcLog("key down: usage \(hid), modifiers \(mods)")
+        }
         if down {
             if clipboardShortcut(hid: hid, mods: mods) { return true }
             pc_key(h, hid, 1, 0, mods)
@@ -410,16 +475,17 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     /// Double tap on the Pencil: switch between the Brush (B) and the Eraser (E).
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveTap tap: UIPencilInteraction.Tap) {
+        pcLog("pencil: double tap")
         eraserOn.toggle()
         tapKey(eraserOn ? 0x08 : 0x05)
     }
 
-    /// Squeeze on the Pencil Pro: the Eyedropper (I).
+    /// Squeeze on the Pencil Pro: opens the tool menu (a right click, which shows the brush
+    /// picker for brush tools) where the Pencil is.
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
-        if squeeze.phase == .ended {
-            eraserOn = false
-            tapKey(0x0C)
-        }
+        guard squeeze.phase == .ended, let h = handle else { return }
+        pcLog("pencil: squeeze")
+        pc_click(h, Float(lastHover.x), Float(lastHover.y), 1, 0)
     }
 
     // MARK: Gestures
@@ -490,23 +556,46 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard let h = handle else { return }
         // An Apple Pencil hovering reports a distance from the glass; a mouse or trackpad does not.
         let isPencil = g.zOffset > 0
+        if hoverLogged < 8 {
+            hoverLogged += 1
+            pcLog("hover: state \(g.state.rawValue), pencil: \(isPencil), zOffset \(g.zOffset)")
+        }
         switch g.state {
         case .began, .changed:
             let p = g.location(in: self)
+            lastHover = p
             if isPencil {
                 pencilHovering = true
                 pencilLastSeen = CACurrentMediaTime()
-                if !ignoredTouches.isEmpty || fingerTouch != nil { cancelFinger() }
+                if fingerTouch != nil { cancelFinger() }
+                let alt = Double(g.altitudeAngle)
+                let az = g.azimuthUnitVector(in: self)
+                let (tx, ty) = MetalView.tilt(altitude: alt, azimuth: az)
+                var roll: Float = 0
+                if #available(iOS 17.5, *) { roll = Float(g.rollAngle * 180 / CGFloat.pi) }
+                pc_pen_hover(h, Float(p.x), Float(p.y), tx, ty, roll)
+            } else {
+                pc_pointer_moved(h, Float(p.x), Float(p.y))
             }
-            pc_pointer_moved(h, Float(p.x), Float(p.y))
         case .ended, .cancelled:
             if pencilHovering {
                 pencilHovering = false
                 pencilLastSeen = CACurrentMediaTime()
+                pc_pen_hover_end(h)
+            } else {
+                pc_pointer_gone(h)
             }
-            pc_pointer_gone(h)
         default: break
         }
+    }
+
+    /// Tilt in degrees on both axes (like a browser's pen events), from the Pencil's altitude and azimuth.
+    private static func tilt(altitude: Double, azimuth: CGVector) -> (Float, Float) {
+        let upright = max(sin(altitude), 0.0001)
+        let flat = cos(altitude)
+        let tx = Float(atan2(Double(azimuth.dx) * flat, upright) * 180 / Double.pi)
+        let ty = Float(atan2(Double(azimuth.dy) * flat, upright) * 180 / Double.pi)
+        return (tx, ty)
     }
 
     @objc private func pointerScroll(_ g: UIPanGestureRecognizer) {
@@ -537,9 +626,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     }
 
     @objc private func longPressed(_ g: UILongPressGestureRecognizer) {
-        guard g.state == .began, fingerTouch != nil, !fingerPressed else { return }
-        longPressFired = true
-        syntheticClick(g.location(in: self), button: 1, mods: 0)
+        guard g.state == .began, fingerTouch != nil, let h = handle else { return }
+        let p = g.location(in: self)
+        pc_long_press(h, Float(p.x), Float(p.y))
     }
 
     @objc private func twoFingerTap(_ g: UITapGestureRecognizer) {
@@ -554,52 +643,68 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     // MARK: Pencil, pointer and finger touches
 
-    /// A press and release a moment apart, so the app sees a real click.
-    private func syntheticClick(_ p: CGPoint, button: Int32, mods: UInt32) {
-        guard let h = handle else { return }
-        let x = Float(p.x), y = Float(p.y)
-        pc_pointer_moved(h, x, y)
-        pc_pointer_button(h, x, y, button, 1, mods)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
-            guard let self = self, let h = self.handle else { return }
-            pc_pointer_button(h, x, y, button, 0, mods)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
-                guard let self = self, let h = self.handle else { return }
-                pc_pointer_gone(h)
-            }
-        }
-    }
-
     /// Drops a finger that was acting as the pointer (a second finger or the Pencil arrived).
     private func cancelFinger() {
-        if fingerPressed, let t = fingerTouch, let h = handle {
-            let p = t.location(in: self)
-            pc_pointer_button(h, Float(p.x), Float(p.y), 0, 0, 0)
-            pc_pointer_gone(h)
+        if fingerTouch != nil, let h = handle {
+            pc_finger(h, 3, Float(fingerLast.x), Float(fingerLast.y), 0)
         }
         fingerTouch = nil
-        fingerPressed = false
     }
 
-    /// Sends the Pencil's position, pressure, tilt and roll (all the in-between samples too).
-    private func sendPen(_ touch: UITouch, phase: Int32, event: UIEvent?, mods: UInt32) {
-        guard let h = handle else { return }
+    /// Adds a Pencil sample. It is sent once its true pressure has arrived (a few milliseconds).
+    private func queuePen(_ touch: UITouch, phase: Int32, event: UIEvent?, mods: UInt32) {
         var samples: [UITouch] = [touch]
         if phase == 1, let more = event?.coalescedTouches(for: touch), !more.isEmpty { samples = more }
         for c in samples {
-            let p = c.location(in: self)
             let maxForce = c.maximumPossibleForce
-            let pressure: Float = maxForce > 0 ? Float(c.force / maxForce) : 1
-            let altitude = Double(c.altitudeAngle)
-            let az = c.azimuthUnitVector(in: self)
-            let upright = max(sin(altitude), 0.0001)
-            let flat = cos(altitude)
-            let tiltX = Float(atan2(Double(az.dx) * flat, upright) * 180 / Double.pi)
-            let tiltY = Float(atan2(Double(az.dy) * flat, upright) * 180 / Double.pi)
-            var roll: Float = 0
-            if #available(iOS 17.5, *) { roll = Float(c.rollAngle * 180 / CGFloat.pi) }
-            pc_pen(h, Float(p.x), Float(p.y), phase, pressure, tiltX, tiltY, roll, mods)
+            let waiting = c.estimationUpdateIndex != nil && c.estimatedPropertiesExpectingUpdates.contains(.force)
+            var roll: CGFloat = 0
+            if #available(iOS 17.5, *) { roll = c.rollAngle }
+            penQueue.append(PenItem(
+                phase: phase,
+                location: c.preciseLocation(in: self),
+                force: maxForce > 0 ? c.force : 1,
+                altitude: c.altitudeAngle,
+                azimuth: c.azimuthUnitVector(in: self),
+                roll: roll,
+                mods: mods,
+                index: waiting ? c.estimationUpdateIndex : nil,
+                ready: !waiting,
+                time: CACurrentMediaTime()))
         }
+        flushPen(all: false)
+    }
+
+    /// iPadOS refines the Pencil's pressure a few milliseconds after the touch. Matching the
+    /// refined value to its sample gives an even, natural stroke.
+    override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) {
+        for t in touches where t.type == .pencil {
+            guard let index = t.estimationUpdateIndex,
+                  let i = penQueue.firstIndex(where: { $0.index == index }) else { continue }
+            penQueue[i].force = t.force
+            penQueue[i].altitude = t.altitudeAngle
+            if !t.estimatedPropertiesExpectingUpdates.contains(.force) { penQueue[i].ready = true }
+        }
+        flushPen(all: false)
+    }
+
+    private func flushPen(all: Bool) {
+        let now = CACurrentMediaTime()
+        while let first = penQueue.first, first.ready || all || now - first.time > 0.05 {
+            penQueue.removeFirst()
+            sendPen(first)
+        }
+    }
+
+    private func sendPen(_ item: PenItem) {
+        guard let h = handle else { return }
+        var pressure = Float(max(0, min(1, item.force / pressureDivisor)))
+        // A little smoothing of the pressure only (never of the position) evens out the response.
+        if item.phase == 0 { smoothedPressure = pressure } else { smoothedPressure = smoothedPressure * 0.5 + pressure * 0.5 }
+        pressure = smoothedPressure
+        let (tx, ty) = MetalView.tilt(altitude: Double(item.altitude), azimuth: item.azimuth)
+        pc_pen(h, Float(item.location.x), Float(item.location.y), item.phase, pressure, tx, ty,
+               Float(item.roll * 180 / CGFloat.pi), item.mods)
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -615,7 +720,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 cancelFinger()
                 pencilTouch = t
                 pencilLastSeen = CACurrentMediaTime()
-                sendPen(t, phase: 0, event: event, mods: mods)
+                penQueue.removeAll()
+                queuePen(t, phase: 0, event: event, mods: mods)
             case .indirectPointer:
                 pointerButton = (event?.buttonMask.contains(.secondary) ?? false) ? 1 : 0
                 pc_pointer_moved(h, Float(p.x), Float(p.y))
@@ -628,10 +734,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 directTouches.insert(t)
                 if directTouches.count == 1 {
                     fingerTouch = t
-                    fingerStart = p
-                    fingerStartTime = t.timestamp
-                    fingerPressed = false
-                    longPressFired = false
+                    fingerLast = p
+                    pc_finger(h, 0, Float(p.x), Float(p.y), mods)
                 } else {
                     // A second finger means scrolling, pinching or a tap gesture, never a press.
                     cancelFinger()
@@ -647,23 +751,13 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             let p = t.location(in: self)
             switch t.type {
             case .pencil:
-                if t === pencilTouch { sendPen(t, phase: 1, event: event, mods: mods) }
+                if t === pencilTouch { queuePen(t, phase: 1, event: event, mods: mods) }
             case .indirectPointer:
                 pc_pointer_moved(h, Float(p.x), Float(p.y))
             default:
                 guard t === fingerTouch else { continue }
-                if !fingerPressed {
-                    let dx = p.x - fingerStart.x, dy = p.y - fingerStart.y
-                    if dx * dx + dy * dy > 64 && !longPressFired {
-                        // The finger moved: now it is a drag, starting where it first landed.
-                        fingerPressed = true
-                        pc_pointer_moved(h, Float(fingerStart.x), Float(fingerStart.y))
-                        pc_pointer_button(h, Float(fingerStart.x), Float(fingerStart.y), 0, 1, mods)
-                        pc_pointer_moved(h, Float(p.x), Float(p.y))
-                    }
-                } else {
-                    pc_pointer_moved(h, Float(p.x), Float(p.y))
-                }
+                fingerLast = p
+                pc_finger(h, 1, Float(p.x), Float(p.y), mods)
             }
         }
     }
@@ -677,7 +771,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             switch t.type {
             case .pencil:
                 if t === pencilTouch {
-                    sendPen(t, phase: cancelled ? 3 : 2, event: event, mods: mods)
+                    queuePen(t, phase: cancelled ? 3 : 2, event: event, mods: mods)
                     pencilTouch = nil
                     pencilLastSeen = CACurrentMediaTime()
                 }
@@ -686,15 +780,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             default:
                 directTouches.remove(t)
                 guard t === fingerTouch else { continue }
-                if fingerPressed {
-                    pc_pointer_button(h, Float(p.x), Float(p.y), 0, 0, mods)
-                    pc_pointer_gone(h)
-                } else if !cancelled && !longPressFired && !pencilNear && (t.timestamp - fingerStartTime) < 0.5 {
-                    // A quick tap: one click where the finger landed.
-                    syntheticClick(fingerStart, button: 0, mods: mods)
-                }
+                pc_finger(h, cancelled ? 3 : 2, Float(p.x), Float(p.y), mods)
                 fingerTouch = nil
-                fingerPressed = false
             }
         }
     }
