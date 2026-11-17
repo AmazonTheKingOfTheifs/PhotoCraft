@@ -1,11 +1,12 @@
 //! PhotoCraft for iPad: the engine and egui interface, drawn with Metal, driven by a Swift shell.
 #![allow(clippy::missing_safety_doc)]
+#![allow(dead_code)]
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -24,10 +25,14 @@ use photocraft_ui_egui::{FileDialogAnswer, FileDialogReply, FileDialogRequest, I
 #[derive(Clone, Copy)]
 pub struct PCCallbacks {
     pub user: *mut c_void,
-    /// Show Apple's Open sheet. The argument is 1 when several files may be chosen.
-    pub open_dialog: Option<unsafe extern "C" fn(*mut c_void, c_int)>,
-    /// A file was written to the app's Working folder and should be offered to the Files app.
-    pub export_file: Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
+    /// Show the import chooser (Photos or Files). Arguments: several files allowed (1/0), and
+    /// whether pictures make sense here, so Photos is offered (1/0).
+    pub open_dialog: Option<unsafe extern "C" fn(*mut c_void, c_int, c_int)>,
+    /// Show Apple's Save to Files sheet for a file with this name.
+    pub save_dialog: Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
+    /// Write a file that lives outside the app (Files, iCloud Drive) the way iPadOS wants it.
+    /// Returns 1 on success.
+    pub write_file: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const u8, usize) -> c_int>,
     pub open_url: Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
     pub copy_text: Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
 }
@@ -161,14 +166,16 @@ struct PendingOpen {
     reply: FileDialogReply,
     multiple: bool,
     files: Vec<(String, Vec<u8>)>,
+    paths: Vec<String>,
 }
 
 thread_local! {
     static DIALOG: RefCell<Option<PendingOpen>> = const { RefCell::new(None) };
+    static SAVE_DIALOG: RefCell<Option<FileDialogReply>> = const { RefCell::new(None) };
 }
 
-/// Set when the person asked for Save As (or an export): the next write is offered to Files.
-static ASK_EXPORT: AtomicBool = AtomicBool::new(false);
+/// How many key presses are written to the log (to find out why a shortcut does nothing).
+static KEY_LOG: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------------------------
 // Services: what the app asks the iPad to do
@@ -183,45 +190,48 @@ fn build_services(cb: PCCallbacks, inbox: &Inbox, place_inbox: &PlaceInbox) -> S
             photocraft_io::export(doc, path, &settings.io_options()).map(|r| (r.bytes, r.warnings)).map_err(|e| e.to_string())
         })),
         file_dialog: Some(Box::new(move |request, _parent, reply| match request {
-            FileDialogRequest::Open { multiple, .. } => {
-                note(&format!("the app asked to open a file (several: {multiple})"));
-                DIALOG.with(|d| *d.borrow_mut() = Some(PendingOpen { reply, multiple, files: Vec::new() }));
+            FileDialogRequest::Open { multiple, extensions, .. } => {
+                // Pictures make sense unless the app asks for specific other kinds of file only.
+                let kinds = format!("{extensions:?}").to_lowercase();
+                let pictures = kinds == "none" || kinds.contains("png") || kinds.contains("jpg") || kinds.contains("jpeg");
+                note(&format!("the app asked to open a file (several: {multiple}, pictures: {pictures})"));
+                DIALOG.with(|d| *d.borrow_mut() = Some(PendingOpen { reply, multiple, files: Vec::new(), paths: Vec::new() }));
                 if let Some(f) = cb.open_dialog {
-                    unsafe { f(cb.user, multiple as c_int) }
+                    unsafe { f(cb.user, multiple as c_int, pictures as c_int) }
                 }
             }
             FileDialogRequest::Folder { .. } => reply.send(None),
-            // Save As, a first save and exports: the app writes a working file inside PhotoCraft's
-            // own folder, and the shell then offers that file to Apple's Save to Files sheet.
+            // Save As, a first save and exports: Apple's Save to Files sheet picks the place, and
+            // the app then writes straight to it. No hidden copy is kept inside the app.
             FileDialogRequest::Save { suggested } => {
                 let name = std::path::Path::new(&suggested)
                     .file_name()
                     .map_or_else(|| suggested.clone(), |n| n.to_string_lossy().to_string());
-                let safe = name.replace('/', "_");
-                let Some(dir) = working_dir() else {
-                    reply.send(None);
-                    return;
-                };
-                let _ = std::fs::create_dir_all(&dir);
-                let path = dir.join(safe).to_string_lossy().into_owned();
-                note(&format!("the app asked to save: {path}"));
-                ASK_EXPORT.store(true, Ordering::SeqCst);
-                reply.send(Some(FileDialogAnswer::SaveTo(path)));
+                note(&format!("the app asked to save as: {name}"));
+                SAVE_DIALOG.with(|d| *d.borrow_mut() = Some(reply));
+                if let Some(f) = cb.save_dialog {
+                    let c = cstring(&name);
+                    unsafe { f(cb.user, c.as_ptr()) }
+                }
             }
         })),
         write: Some(Box::new(move |path: &str, bytes: &[u8]| {
+            // Files inside the app are written directly. Files in Files / iCloud Drive go through
+            // Swift, which writes them the way iPadOS requires.
+            let home = std::env::var("HOME").unwrap_or_default();
+            let inside = !home.is_empty() && path.starts_with(&home);
+            if !inside && let Some(f) = cb.write_file {
+                let c = cstring(path);
+                let ok = unsafe { f(cb.user, c.as_ptr(), bytes.as_ptr(), bytes.len()) };
+                note(&format!("wrote {path} through Files ({} bytes): {}", bytes.len(), ok != 0));
+                return if ok != 0 { Ok(()) } else { Err(format!("{path}: iPadOS did not allow writing this file")) };
+            }
             let p = std::path::Path::new(path);
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             std::fs::write(p, bytes).map_err(|e| format!("{path}: {e}"))?;
             note(&format!("wrote {path} ({} bytes)", bytes.len()));
-            if ASK_EXPORT.swap(false, Ordering::SeqCst)
-                && let Some(f) = cb.export_file
-            {
-                let c = cstring(path);
-                unsafe { f(cb.user, c.as_ptr()) }
-            }
             Ok(())
         })),
         encode_png: Some(Box::new(|w, h, rgba| {
@@ -276,6 +286,31 @@ struct Host {
     feed: StylusFeed,
     pen_down: bool,
     wants_keyboard: bool,
+    /// Fingers draw on the canvas (otherwise they pan and zoom it, and only the Pencil draws).
+    finger_draws: bool,
+    /// A finger or Pencil that has not decided yet what it is doing (tap, scroll, drag, draw).
+    gesture: Option<Gesture>,
+    /// Events held back a few frames (a click's release, the pointer leaving).
+    posts: Vec<(u8, egui::Event)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GMode {
+    Pending,
+    Pointer,
+    Scroll,
+    Pan,
+}
+
+#[derive(Clone, Copy)]
+struct Gesture {
+    start: (f32, f32),
+    last: (f32, f32),
+    t0: Instant,
+    mode: GMode,
+    pen: bool,
+    consumed: bool,
+    on_canvas: bool,
 }
 
 fn wake_at(deadline: &Arc<Mutex<Option<Instant>>>, at: Instant) {
@@ -383,6 +418,9 @@ impl Host {
             feed,
             pen_down: false,
             wants_keyboard: false,
+            finger_draws: false,
+            gesture: None,
+            posts: Vec::new(),
         })
     }
 
@@ -408,6 +446,107 @@ impl Host {
     fn pt(&self, x: f32, y: f32) -> egui::Pos2 {
         let z = self.ctx.zoom_factor().max(0.1);
         egui::pos2(x / z, y / z)
+    }
+
+    /// Is this spot on the picture itself (and not on a panel, a menu or a floating window)?
+    fn on_canvas(&self, x: f32, y: f32) -> bool {
+        let p = self.pt(x, y);
+        self.app.last_canvas_rect.contains(p)
+            && self.ctx.layer_id_at(p).is_none_or(|l| l.order == egui::Order::Background)
+    }
+
+    /// An event for a few frames from now.
+    fn post(&mut self, frames: u8, e: egui::Event) {
+        self.posts.push((frames, e));
+        self.wake();
+    }
+
+    /// A click whose press and release land in different frames, so the app sees a real click.
+    fn click(&mut self, x: f32, y: f32, button: egui::PointerButton, keep_pointer: bool) {
+        let pos = self.pt(x, y);
+        let m = self.modifiers;
+        self.push(egui::Event::PointerMoved(pos));
+        self.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers: m });
+        self.post(1, egui::Event::PointerButton { pos, button, pressed: false, modifiers: m });
+        if !keep_pointer {
+            self.post(2, egui::Event::PointerGone);
+        }
+    }
+
+    fn wheel(&mut self, dx: f32, dy: f32) {
+        let z = self.ctx.zoom_factor().max(0.1);
+        let m = self.modifiers;
+        self.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(dx / z, dy / z),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+            modifiers: m,
+        });
+    }
+
+    fn gesture_begin(&mut self, x: f32, y: f32, pen: bool) {
+        let on_canvas = self.on_canvas(x, y);
+        self.gesture = Some(Gesture { start: (x, y), last: (x, y), t0: Instant::now(), mode: GMode::Pending, pen, consumed: false, on_canvas });
+    }
+
+    fn gesture_move(&mut self, x: f32, y: f32) {
+        let Some(mut g) = self.gesture else { return };
+        let last = g.last;
+        g.last = (x, y);
+        match g.mode {
+            GMode::Pending => {
+                let (sx, sy) = g.start;
+                let (dx, dy) = (x - sx, y - sy);
+                if dx * dx + dy * dy <= 64.0 {
+                    return;
+                }
+                let draws = g.pen || self.finger_draws;
+                let pointer = if g.on_canvas { draws } else { dy.abs() <= dx.abs() * 1.2 };
+                if pointer {
+                    g.mode = GMode::Pointer;
+                    let sp = self.pt(sx, sy);
+                    let cp = self.pt(x, y);
+                    let m = self.modifiers;
+                    self.push(egui::Event::PointerMoved(sp));
+                    self.push(egui::Event::PointerButton { pos: sp, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
+                    self.push(egui::Event::PointerMoved(cp));
+                } else {
+                    // A finger on the picture pans it; a finger dragging up or down on a panel or
+                    // menu scrolls it.
+                    g.mode = if g.on_canvas { GMode::Pan } else { GMode::Scroll };
+                    self.wheel(dx, dy);
+                }
+            }
+            GMode::Pointer => {
+                let cp = self.pt(x, y);
+                self.push(egui::Event::PointerMoved(cp));
+            }
+            GMode::Scroll | GMode::Pan => self.wheel(x - last.0, y - last.1),
+        }
+        self.gesture = Some(g);
+    }
+
+    fn gesture_end(&mut self, x: f32, y: f32, cancelled: bool) {
+        let Some(g) = self.gesture.take() else { return };
+        match g.mode {
+            GMode::Pending => {
+                let draws = g.pen || self.finger_draws;
+                let quick = g.t0.elapsed() < Duration::from_millis(500);
+                // A quick tap clicks. A tap on the picture with a finger does nothing, unless
+                // fingers are set to draw.
+                if !cancelled && !g.consumed && quick && !(g.on_canvas && !draws) {
+                    self.click(g.start.0, g.start.1, egui::PointerButton::Primary, false);
+                }
+            }
+            GMode::Pointer => {
+                let pos = self.pt(x, y);
+                let m = self.modifiers;
+                self.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
+                self.post(1, egui::Event::PointerGone);
+            }
+            GMode::Scroll | GMode::Pan => {}
+        }
     }
 
     fn handle_output(&self, out: &egui::PlatformOutput) {
@@ -453,7 +592,22 @@ impl Host {
         raw.focused = self.focused;
         raw.system_theme = Some(if self.dark { egui::Theme::Dark } else { egui::Theme::Light });
         raw.max_texture_side = Some(self.rs.device.limits().max_texture_dimension_2d as usize);
+        let mut due = Vec::new();
+        self.posts.retain_mut(|(n, e)| {
+            if *n == 0 {
+                due.push(e.clone());
+                false
+            } else {
+                *n -= 1;
+                true
+            }
+        });
+        self.events.extend(due);
+        if !self.posts.is_empty() {
+            self.wake();
+        }
         raw.events = std::mem::take(&mut self.events);
+        let keys_in = raw.events.iter().filter(|e| matches!(e, egui::Event::Key { pressed: true, .. })).count();
         if let Some(v) = raw.viewports.get_mut(&egui::ViewportId::ROOT) {
             v.native_pixels_per_point = Some(self.scale);
             v.inner_rect = Some(rect);
@@ -461,11 +615,23 @@ impl Host {
 
         let ctx = self.ctx.clone();
         eframe::App::raw_input_hook(&mut self.app, &ctx, &mut raw);
-        let logic = ctx.run_logic(&raw, |c| eframe::App::logic(&mut self.app, c, &mut self.frame));
-        let mut full = ctx.run_ui(raw, |ui| eframe::App::ui(&mut self.app, ui, &mut self.frame));
-        self.handle_output(&logic.platform_output);
+        // One pass, like eframe itself: the app's logic (shortcuts, typing) runs inside the UI pass.
+        let mut full = ctx.run_ui(raw, |ui| {
+            eframe::App::logic(&mut self.app, ui.ctx(), &mut self.frame);
+            eframe::App::ui(&mut self.app, ui, &mut self.frame);
+        });
         self.handle_output(&full.platform_output);
-        self.wants_keyboard = ctx.egui_wants_keyboard_input();
+        // The on-screen keyboard is wanted only where text can be typed.
+        self.wants_keyboard = full.platform_output.ime.is_some();
+        if keys_in > 0 && KEY_LOG.load(Ordering::Relaxed) < 80 {
+            let left = ctx.input(|i| i.events.iter().filter(|e| matches!(e, egui::Event::Key { pressed: true, .. })).count());
+            note(&format!(
+                "keys: {keys_in} pressed this frame, {left} left unused; typing field: {}; focus id: {:?}",
+                self.wants_keyboard,
+                ctx.memory(|m| m.focused())
+            ));
+            KEY_LOG.fetch_add(1, Ordering::Relaxed);
+        }
 
         if let Some(vo) = full.viewport_output.get(&egui::ViewportId::ROOT)
             && let Some(at) = Instant::now().checked_add(vo.repaint_delay)
@@ -671,9 +837,10 @@ pub unsafe extern "C" fn pc_pointer_button(h: *mut c_void, x: f32, y: f32, butto
     }
 }
 
-/// Apple Pencil. phase: 0 touches down, 1 moves while touching, 2 lifts, 3 is cancelled.
+/// Apple Pencil touching the screen. phase: 0 touches down, 1 moves, 2 lifts, 3 is cancelled.
 /// Pressure is 0 to 1; tilt is in degrees (W3C style, like a browser's pen events); rotation is
-/// the barrel roll in degrees.
+/// the barrel roll in degrees. On the picture the Pencil draws at once; on a panel or menu it
+/// taps, drags sliders and scrolls lists.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_pen(
     h: *mut c_void,
@@ -699,16 +866,24 @@ pub unsafe extern "C" fn pc_pen(
         };
         match phase {
             0 => {
-                h.pen_down = true;
-                h.feed.set(Some(sample));
-                h.push(egui::Event::PointerMoved(pos));
-                h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
+                if h.on_canvas(x, y) {
+                    h.gesture = None;
+                    h.pen_down = true;
+                    h.feed.set(Some(sample));
+                    h.push(egui::Event::PointerMoved(pos));
+                    h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
+                } else {
+                    h.feed.set(None);
+                    h.gesture_begin(x, y, true);
+                }
             }
             1 => {
                 if h.pen_down {
                     h.feed.set(Some(sample));
+                    h.push(egui::Event::PointerMoved(pos));
+                } else if h.gesture.is_some_and(|g| g.pen) {
+                    h.gesture_move(x, y);
                 }
-                h.push(egui::Event::PointerMoved(pos));
             }
             _ => {
                 if h.pen_down {
@@ -717,9 +892,89 @@ pub unsafe extern "C" fn pc_pen(
                     h.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
                     // The stroke's last samples keep their pressure; nothing is held after this.
                     h.feed.set(None);
+                } else if h.gesture.is_some_and(|g| g.pen) {
+                    h.gesture_end(x, y, phase == 3);
                 }
             }
         }
+    }
+}
+
+/// Apple Pencil hovering above the screen: moves the pointer (the brush preview follows it) and
+/// reports the Pencil's tilt and roll, with no pressure, like a pen hovering over a Mac tablet.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_pen_hover(h: *mut c_void, x: f32, y: f32, tilt_x: f32, tilt_y: f32, rotation: f32) {
+    if let Some(h) = unsafe { host(h) } {
+        if h.pen_down {
+            return;
+        }
+        let pos = h.pt(x, y);
+        h.feed.set(Some(PenSample { pressure: 0.0, tilt_x, tilt_y, rotation: rotation.rem_euclid(360.0), eraser: false }));
+        h.push(egui::Event::PointerMoved(pos));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_pen_hover_end(h: *mut c_void) {
+    if let Some(h) = unsafe { host(h) } {
+        if !h.pen_down {
+            h.feed.set(None);
+            h.push(egui::Event::PointerGone);
+        }
+    }
+}
+
+/// A finger. phase: 0 touches down, 1 moves, 2 lifts, 3 is cancelled. One finger taps, scrolls
+/// panels, pans the picture, or (when fingers are set to draw) draws; the Rust side decides.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_finger(h: *mut c_void, phase: c_int, x: f32, y: f32, mods: u32) {
+    if let Some(h) = unsafe { host(h) } {
+        h.set_modifiers(to_mods(mods));
+        match phase {
+            0 => h.gesture_begin(x, y, false),
+            1 => {
+                if h.gesture.is_some_and(|g| !g.pen) {
+                    h.gesture_move(x, y);
+                }
+            }
+            _ => {
+                if h.gesture.is_some_and(|g| !g.pen) {
+                    h.gesture_end(x, y, phase == 3);
+                }
+            }
+        }
+    }
+}
+
+/// A long press by a finger: a right click there.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_long_press(h: *mut c_void, x: f32, y: f32) {
+    if let Some(h) = unsafe { host(h) } {
+        if let Some(g) = h.gesture.as_mut() {
+            if g.mode != GMode::Pending {
+                return;
+            }
+            g.consumed = true;
+        }
+        h.click(x, y, egui::PointerButton::Secondary, true);
+    }
+}
+
+/// A click with the given button (0 left, 1 right) at a spot, for the Pencil squeeze.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_click(h: *mut c_void, x: f32, y: f32, button: c_int, mods: u32) {
+    if let Some(h) = unsafe { host(h) } {
+        h.set_modifiers(to_mods(mods));
+        let b = if button == 1 { egui::PointerButton::Secondary } else { egui::PointerButton::Primary };
+        h.click(x, y, b, button == 1);
+    }
+}
+
+/// Fingers draw (1) or only pan and zoom the picture (0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_set_finger_draw(h: *mut c_void, on: c_int) {
+    if let Some(h) = unsafe { host(h) } {
+        h.finger_draws = on != 0;
     }
 }
 
@@ -727,15 +982,7 @@ pub unsafe extern "C" fn pc_pen(
 pub unsafe extern "C" fn pc_scroll(h: *mut c_void, dx: f32, dy: f32, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
         h.set_modifiers(to_mods(mods));
-        let z = h.ctx.zoom_factor().max(0.1);
-        let m = h.modifiers;
-        h.push(egui::Event::MouseWheel {
-            unit: egui::MouseWheelUnit::Point,
-            delta: egui::vec2(dx / z, dy / z),
-            phase: egui::TouchPhase::Move,
-            source: egui::MouseWheelSource::Unknown,
-            modifiers: m,
-        });
+        h.wheel(dx, dy);
     }
 }
 
@@ -758,6 +1005,9 @@ pub unsafe extern "C" fn pc_key(h: *mut c_void, hid: u32, pressed: c_int, repeat
         h.set_modifiers(to_mods(mods));
         let Some(key) = hid_to_key(hid) else { return };
         let m = h.modifiers;
+        if pressed != 0 && KEY_LOG.load(Ordering::Relaxed) < 80 {
+            note(&format!("key sent: {key:?} (command: {}, shift: {})", m.command, m.shift));
+        }
         h.push(egui::Event::Key { key, physical_key: Some(key), pressed: pressed != 0, repeat: repeat != 0, modifiers: m });
     }
 }
@@ -821,19 +1071,48 @@ pub unsafe extern "C" fn pc_dialog_file(_h: *mut c_void, name: *const c_char, da
     }
 }
 
+/// A file chosen in place (not copied): the app reads and saves it by its real path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dialog_path(_h: *mut c_void, path: *const c_char) {
+    if let Some(path) = unsafe { from_c(path) } {
+        note(&format!("the Open sheet returned a path: {path}"));
+        DIALOG.with(|d| {
+            if let Some(p) = d.borrow_mut().as_mut() {
+                p.paths.push(path);
+            }
+        });
+    }
+}
+
 /// The Open sheet is finished (ok = 1) or was cancelled (ok = 0).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_dialog_end(h: *mut c_void, ok: c_int) {
     let pending = DIALOG.with(|d| d.borrow_mut().take());
     if let Some(p) = pending {
-        let answer = if ok == 0 || p.files.is_empty() {
+        let answer = if ok == 0 || (p.files.is_empty() && p.paths.is_empty()) {
             None
+        } else if !p.paths.is_empty() {
+            Some(FileDialogAnswer::Paths(p.paths))
         } else if p.multiple {
             Some(FileDialogAnswer::ContentsMany(p.files))
         } else {
             p.files.into_iter().next().map(|(name, bytes)| FileDialogAnswer::Contents(name, bytes))
         };
         p.reply.send(answer);
+    }
+    if let Some(h) = unsafe { host(h) } {
+        h.wake();
+    }
+}
+
+/// The Save to Files sheet is finished: the place chosen (a path), or null when cancelled.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_save_dialog_end(h: *mut c_void, path: *const c_char) {
+    let reply = SAVE_DIALOG.with(|d| d.borrow_mut().take());
+    if let Some(reply) = reply {
+        let chosen = unsafe { from_c(path) };
+        note(&format!("the Save sheet returned: {chosen:?}"));
+        reply.send(chosen.map(FileDialogAnswer::SaveTo));
     }
     if let Some(h) = unsafe { host(h) } {
         h.wake();
