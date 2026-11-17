@@ -63,21 +63,15 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p logs/upstream
-          for f in \
-            crates/ui-egui/src/panels/title_bar.rs \
-            crates/ui-egui/src/titlebar.rs \
-            crates/ui-egui/src/work_area.rs \
-            crates/ui-egui/src/file_dialog.rs \
-            crates/ui-egui/src/gpu_canvas.rs \
-            crates/ui-egui/src/input/shortcuts.rs \
-            crates/ui-egui/src/dialogs/file_ui.rs \
-            crates/ui-egui/src/app/gpu.rs \
-            crates/ui-egui/src/os_window.rs \
-            crates/text/src/fonts.rs ; do
-            if [ -f "$f" ]; then cp "$f" "logs/upstream/$(echo $f | tr / _).txt"; fi
+          # Files the next round of fixes needs to read (names are searched, not guessed).
+          for pattern in 'services.rs' 'shortcut_dispatch.rs' 'tool_cursor.rs' 'status_bar*.rs' 'zoom_field.rs' \
+                         'type_tool.rs' 'state.rs' 'fonts.rs' 'menu_keys.rs' 'canvas_tool_menu.rs' \
+                         'brush_cursor*.rs' 'stroke*.rs' 'smoothing*.rs' 'pen_input*.rs' 'tablet*.rs' 'autosave*.rs' ; do
+            for f in $(find crates apps -name "$pattern" -not -path '*/target/*' 2>/dev/null | head -6); do
+              if [ "$(wc -c < "$f")" -lt 400000 ]; then cp "$f" "logs/upstream/$(echo $f | tr / _).txt"; fi
+            done
           done
-          grep -rn "pub fn start_scan\|pub fn families\|pub fn catalog" --include=*.rs crates > logs/upstream/font-api.txt || true
-          ls logs/upstream
+          ls logs/upstream | head -80
 
       - name: Build the Rust core
         run: |
