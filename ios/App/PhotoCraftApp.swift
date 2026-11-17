@@ -11,6 +11,8 @@ struct PhotoCraftApp: App {
     init() {
         // Before any window exists, so PhotoCraft finds the iPad's fonts when it starts.
         SystemFonts.prepare()
+        // Reopen access to the files you used recently, so Recent files still open.
+        FileAccess.shared.restore()
     }
 
     var body: some Scene {
