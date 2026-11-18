@@ -26,6 +26,7 @@ targets:
         CFBundleDisplayName: PhotoCraft
         UILaunchScreen: {}
         UIFileSharingEnabled: true
+        NSPhotoLibraryAddUsageDescription: PhotoCraft saves the pictures you export to your Photos library.
         LSSupportsOpeningDocumentsInPlace: true
         CFBundleDocumentTypes:
           - CFBundleTypeName: Image
