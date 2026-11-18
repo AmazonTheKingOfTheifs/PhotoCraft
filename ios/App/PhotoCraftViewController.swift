@@ -32,11 +32,6 @@ final class PhotoCraftViewController: UIViewController, UIDocumentPickerDelegate
     /// The empty file Save to Files moves into place.
     private var savePlaceholder: URL?
 
-    private let bar = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
-    private var fingerButton: UIButton?
-    private var barPlaced = false
-    private static let barKey = "PhotoCraftBarPosition"
-
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
 
@@ -63,8 +58,6 @@ final class PhotoCraftViewController: UIViewController, UIDocumentPickerDelegate
         }
         metal.onCopyText = { UIPasteboard.general.string = $0 }
 
-        buildBar()
-
         let nc = NotificationCenter.default
         nc.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.metal.saveState()
@@ -76,149 +69,19 @@ final class PhotoCraftViewController: UIViewController, UIDocumentPickerDelegate
         nc.addObserver(forName: .pcAddFonts, object: nil, queue: .main) { [weak self] _ in
             self?.showFontPicker()
         }
-        nc.addObserver(forName: .pcUIScale, object: nil, queue: .main) { [weak self] note in
-            let info = note.userInfo
-            if (info?["reset"] as? Bool) == true {
-                self?.metal.adjustUIScale(delta: nil, reset: true)
-            } else if let d = info?["delta"] as? Float {
-                self?.metal.adjustUIScale(delta: d, reset: false)
+        nc.addObserver(forName: .pcPhotosSaved, object: nil, queue: .main) { [weak self] note in
+            let ok = (note.object as? Bool) ?? false
+            if ok {
+                self?.message("Saved to Photos", "The picture is now in your Photos app.")
+            } else {
+                let why = (note.userInfo?["error"] as? String) ?? ""
+                self?.message("Couldn’t save to Photos", why.isEmpty ? "Allow PhotoCraft to add photos in Settings › PhotoCraft › Photos." : why)
             }
         }
         nc.addObserver(forName: .pcOpenURL, object: nil, queue: .main) { [weak self] note in
             guard let url = note.object as? URL else { return }
             self?.openFromOutside(url)
         }
-    }
-
-    // MARK: The bar of big buttons
-
-    private func makeButton(_ symbol: String, _ label: String, _ action: Selector?) -> UIButton {
-        var config = UIButton.Configuration.plain()
-        config.image = UIImage(systemName: symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 22, weight: .semibold))
-        config.baseForegroundColor = .white
-        config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16)
-        let b = UIButton(configuration: config)
-        if let action = action { b.addTarget(self, action: action, for: .touchUpInside) }
-        b.accessibilityLabel = label
-        return b
-    }
-
-    private func buildBar() {
-        let undo = makeButton("arrow.uturn.backward", "Undo", #selector(tapUndo))
-        let redo = makeButton("arrow.uturn.forward", "Redo", #selector(tapRedo))
-        let fit = makeButton("arrow.up.left.and.arrow.down.right", "Fit on screen", #selector(tapFit))
-        let finger = makeButton("hand.draw", "Draw with finger", #selector(tapFinger))
-        fingerButton = finger
-        let size = makeButton("textformat.size", "Interface size", nil)
-        size.showsMenuAsPrimaryAction = true
-        size.menu = UIMenu(title: "Interface size", children: [
-            UIAction(title: "Larger", image: UIImage(systemName: "plus")) { [weak self] _ in self?.metal.adjustUIScale(delta: 0.1, reset: false) },
-            UIAction(title: "Smaller", image: UIImage(systemName: "minus")) { [weak self] _ in self?.metal.adjustUIScale(delta: -0.1, reset: false) },
-            UIAction(title: "Automatic", image: UIImage(systemName: "arrow.counterclockwise")) { [weak self] _ in self?.metal.adjustUIScale(delta: nil, reset: true) }
-        ])
-        let pencil = makeButton("pencil.tip", "Pencil pressure", nil)
-        pencil.showsMenuAsPrimaryAction = true
-        pencil.menu = UIMenu(title: "Pencil pressure", children: [
-            UIAction(title: "Softer (light touch is enough)", image: UIImage(systemName: "feather")) { [weak self] _ in
-                self?.metal.adjustPressure(by: 0.3); self?.toast("Pencil: softer")
-            },
-            UIAction(title: "Firmer (needs more pressure)", image: UIImage(systemName: "hand.point.down")) { [weak self] _ in
-                self?.metal.adjustPressure(by: -0.3); self?.toast("Pencil: firmer")
-            },
-            UIAction(title: "Reset", image: UIImage(systemName: "arrow.counterclockwise")) { [weak self] _ in
-                self?.metal.adjustPressure(by: 0, reset: true); self?.toast("Pencil: default")
-            }
-        ])
-
-        let stack = UIStackView(arrangedSubviews: [undo, redo, fit, finger, pencil, size])
-        stack.axis = .horizontal
-        stack.spacing = 0
-        stack.alignment = .center
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        bar.contentView.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: bar.contentView.topAnchor, constant: 4),
-            stack.bottomAnchor.constraint(equalTo: bar.contentView.bottomAnchor, constant: -4),
-            stack.leadingAnchor.constraint(equalTo: bar.contentView.leadingAnchor, constant: 6),
-            stack.trailingAnchor.constraint(equalTo: bar.contentView.trailingAnchor, constant: -6)
-        ])
-        bar.layer.cornerRadius = 22
-        bar.clipsToBounds = true
-        bar.alpha = 0.92
-        view.addSubview(bar)
-        bar.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(dragBar(_:))))
-        refreshFingerButton()
-    }
-
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        let size = bar.contentView.systemLayoutSizeFitting(CGSize(width: view.bounds.width, height: 80),
-                                                           withHorizontalFittingPriority: .fittingSizeLevel,
-                                                           verticalFittingPriority: .fittingSizeLevel)
-        let w = max(size.width + 12, 200), h = max(size.height + 8, 52)
-        if !barPlaced {
-            barPlaced = true
-            var cx = 12 + w / 2
-            var cy = view.bounds.height - view.safeAreaInsets.bottom - h / 2 - 48
-            if let saved = UserDefaults.standard.array(forKey: PhotoCraftViewController.barKey) as? [Double], saved.count == 2 {
-                cx = CGFloat(saved[0]) * view.bounds.width
-                cy = CGFloat(saved[1]) * view.bounds.height
-            }
-            bar.bounds = CGRect(x: 0, y: 0, width: w, height: h)
-            bar.center = CGPoint(x: cx, y: cy)
-        } else {
-            bar.bounds = CGRect(x: 0, y: 0, width: w, height: h)
-        }
-        keepBarOnScreen()
-        view.bringSubviewToFront(bar)
-    }
-
-    private func keepBarOnScreen() {
-        let b = view.bounds, s = bar.bounds.size
-        let cx = min(max(bar.center.x, s.width / 2 + 4), b.width - s.width / 2 - 4)
-        let cy = min(max(bar.center.y, s.height / 2 + 4), b.height - s.height / 2 - 4)
-        bar.center = CGPoint(x: cx, y: cy)
-    }
-
-    @objc private func dragBar(_ g: UIPanGestureRecognizer) {
-        let t = g.translation(in: view)
-        bar.center = CGPoint(x: bar.center.x + t.x, y: bar.center.y + t.y)
-        g.setTranslation(.zero, in: view)
-        keepBarOnScreen()
-        if g.state == .ended {
-            UserDefaults.standard.set([Double(bar.center.x / view.bounds.width), Double(bar.center.y / view.bounds.height)],
-                                      forKey: PhotoCraftViewController.barKey)
-        }
-    }
-
-    @objc private func tapUndo() { metal.undo() }
-    @objc private func tapRedo() { metal.redo() }
-    @objc private func tapFit() { metal.fitOnScreen() }
-
-    @objc private func tapFinger() {
-        metal.setFingersDraw(!metal.fingersDraw)
-        refreshFingerButton()
-        toast(metal.fingersDraw ? "Finger drawing on" : "Finger drawing off: fingers pan and zoom")
-    }
-
-    private func refreshFingerButton() {
-        fingerButton?.configuration?.baseForegroundColor = metal.fingersDraw ? .systemGreen : .white
-    }
-
-    private func toast(_ text: String) {
-        let label = UILabel()
-        label.text = "  \(text)  "
-        label.textColor = .white
-        label.font = .systemFont(ofSize: 17, weight: .semibold)
-        label.backgroundColor = UIColor(white: 0, alpha: 0.75)
-        label.layer.cornerRadius = 16
-        label.clipsToBounds = true
-        label.textAlignment = .center
-        label.sizeToFit()
-        label.frame = label.frame.insetBy(dx: -8, dy: -10)
-        label.center = CGPoint(x: view.bounds.midX, y: bar.frame.minY - 34)
-        view.addSubview(label)
-        UIView.animate(withDuration: 0.3, delay: 1.4, options: [], animations: { label.alpha = 0 }) { _ in label.removeFromSuperview() }
     }
 
     // MARK: Fonts
@@ -360,8 +223,9 @@ final class PhotoCraftViewController: UIViewController, UIDocumentPickerDelegate
 
     // MARK: Saving
 
-    /// Apple's Save to Files sheet. The new file is created where you choose, and PhotoCraft
-    /// then writes straight into it.
+    /// Pictures can go to Photos or Files; everything else goes to Files.
+    private static let pictureTypes: Set<String> = ["png", "jpg", "jpeg", "tif", "tiff", "heic", "heif", "gif", "webp", "bmp"]
+
     private func showSaveSheet(name: String, attempt: Int = 0) {
         if presentedViewController != nil {
             if attempt < 8 {
@@ -371,6 +235,47 @@ final class PhotoCraftViewController: UIViewController, UIDocumentPickerDelegate
             }
             return
         }
+        let ext = URL(fileURLWithPath: name).pathExtension.lowercased()
+        guard PhotoCraftViewController.pictureTypes.contains(ext) else {
+            showFilesSaveSheet(name: name)
+            return
+        }
+        let sheet = UIAlertController(title: "Save to", message: name, preferredStyle: .actionSheet)
+        sheet.addAction(UIAlertAction(title: "Photos", style: .default) { [weak self] _ in self?.savePictureToPhotos(name: name) })
+        sheet.addAction(UIAlertAction(title: "Files", style: .default) { [weak self] _ in self?.showFilesSaveSheet(name: name) })
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel) { [weak self] _ in
+            self?.metal.suspendFocus = false
+            self?.metal.deliverSaveDialog(path: nil)
+        })
+        if let pop = sheet.popoverPresentationController {
+            pop.sourceView = view
+            pop.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+            pop.permittedArrowDirections = []
+        }
+        metal.suspendFocus = true
+        present(sheet, animated: true)
+    }
+
+    /// PhotoCraft writes the picture into a temporary place; once it is written it is added to Photos.
+    private func savePictureToPhotos(name: String) {
+        metal.suspendFocus = false
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("PhotoCraftPhotos-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        } catch {
+            pcLog("could not prepare the Photos export: \(error.localizedDescription)")
+            metal.deliverSaveDialog(path: nil)
+            return
+        }
+        let path = folder.appendingPathComponent(name).path
+        pcLog("exporting to Photos via \(path)")
+        PhotosExport.shared.expect(path)
+        metal.deliverSaveDialog(path: path)
+    }
+
+    /// Apple's Save to Files sheet. The new file is created where you choose, and PhotoCraft
+    /// then writes straight into it.
+    private func showFilesSaveSheet(name: String) {
         pcLog("save sheet requested for \(name)")
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("PhotoCraftSave-\(UUID().uuidString)", isDirectory: true)
         let file = folder.appendingPathComponent(name)
