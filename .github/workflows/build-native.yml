@@ -178,6 +178,19 @@ jobs:
           fi
           ls -la "$ICONSET"
 
+      - name: Stamp the version
+        run: |
+          python3 - <<'PYEOF'
+          import os, pathlib
+          build = os.environ["GITHUB_RUN_NUMBER"]
+          p = pathlib.Path("ios/project.yml")
+          s = p.read_text().replace("__BUILD__", build)
+          p.write_text(s)
+          line = f"PhotoCraft version 0.4.0, build {build}"
+          pathlib.Path("logs/version.txt").write_text(line + "\n")
+          print(line)
+          PYEOF
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
