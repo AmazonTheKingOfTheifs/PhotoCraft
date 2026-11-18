@@ -1,4 +1,5 @@
 import Foundation
+import Photos
 
 /// Files you open or save through Apple's Files sheets stay in their own place (no copies).
 /// iPadOS only allows an app to touch such a file while it holds a "security scope" for it, so
@@ -88,5 +89,44 @@ final class FileAccess {
             pcLog("file access: coordination failed for \(url.lastPathComponent): \(e.localizedDescription)")
         }
         return written
+    }
+}
+
+/// Pictures exported to Photos: PhotoCraft writes them to a temporary file, and once the file
+/// is complete it is added to the Photos library.
+final class PhotosExport {
+    static let shared = PhotosExport()
+    private let lock = NSLock()
+    private var pending = Set<String>()
+
+    func expect(_ path: String) {
+        lock.lock(); pending.insert(path); lock.unlock()
+    }
+
+    /// Called after any file has been written; does nothing unless it was meant for Photos.
+    func finished(path: String) {
+        lock.lock()
+        let wanted = pending.remove(path) != nil
+        lock.unlock()
+        guard wanted else { return }
+        let url = URL(fileURLWithPath: path)
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                pcLog("photos: not allowed (\(status.rawValue))")
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .pcPhotosSaved, object: false, userInfo: ["error": "PhotoCraft is not allowed to add photos. Allow it in Settings › PhotoCraft › Photos."])
+                }
+                return
+            }
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetCreationRequest.forAsset().addResource(with: .photo, fileURL: url, options: nil)
+            }) { ok, error in
+                pcLog("photos: saved \(ok) \(error?.localizedDescription ?? "")")
+                try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .pcPhotosSaved, object: ok, userInfo: ["error": error?.localizedDescription ?? ""])
+                }
+            }
+        }
     }
 }
