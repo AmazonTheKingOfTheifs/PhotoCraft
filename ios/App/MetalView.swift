@@ -23,6 +23,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private var startFailed = false
     private var link: CADisplayLink?
     private var softKeyboard = false
+    private var wantsKeyboard = false
+    /// The person hid the on-screen keyboard while a text field is still active.
+    private var keyboardDismissed = false
     private let emptyInput = UIView(frame: .zero)
     private var activeTouch: UITouch?
     private var pointerButton: Int32 = 0
@@ -30,7 +33,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     // Interface size (1.0 is the normal size of the desktop app).
     private var uiScale: Float = 1.3
-    private static let scaleKey = "PhotoCraftUIScale"
 
     // Apple Pencil and palm rejection.
     private var pencilTouch: UITouch?
@@ -58,9 +60,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     }
     private var penQueue: [PenItem] = []
     private var smoothedPressure: Float = 0
-    private static let pressureKey = "PhotoCraftPressureDivisor"
-    /// The force (1.0 is an average touch) that counts as full pressure. Lower is more sensitive.
-    private var pressureDivisor: CGFloat = 2.5
 
     // Fingers: one finger is decided on by the Rust side (tap, scroll, pan or draw);
     // two or more fingers are gestures.
@@ -68,12 +67,21 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private var ignoredTouches = Set<UITouch>()
     private var fingerTouch: UITouch?
     private var fingerLast = CGPoint.zero
-    private var fingerDraws = false
-    private static let fingerKey = "PhotoCraftFingerDraws"
 
     /// True while the Pencil is touching, hovering, or has only just left the screen.
     private var pencilNear: Bool {
-        pencilTouch != nil || pencilHovering || (CACurrentMediaTime() - pencilLastSeen) < palmGrace
+        pruneTouches()
+        let since = CACurrentMediaTime() - pencilLastSeen
+        // A hover that stopped reporting counts for a second at most.
+        return pencilTouch != nil || (pencilHovering && since < 1.0) || since < palmGrace
+    }
+
+    /// Forgets touches that have ended without being reported, so nothing ever gets stuck.
+    private func pruneTouches() {
+        if let t = pencilTouch, t.phase == .ended || t.phase == .cancelled { pencilTouch = nil }
+        directTouches = directTouches.filter { $0.phase != .ended && $0.phase != .cancelled }
+        ignoredTouches = ignoredTouches.filter { $0.phase != .ended && $0.phase != .cancelled }
+        if let f = fingerTouch, f.phase == .ended || f.phase == .cancelled { cancelFinger() }
     }
 
     // UITextInputTraits (no autocorrect while typing)
@@ -145,13 +153,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             startFailed = true
         } else {
             pushTheme()
-            let saved = UserDefaults.standard.float(forKey: MetalView.scaleKey)
-            uiScale = saved > 0 ? saved : autoScale()
+            uiScale = autoScale()
             pc_set_ui_scale(handle, uiScale)
-            let d = UserDefaults.standard.double(forKey: MetalView.pressureKey)
-            if d > 0 { pressureDivisor = CGFloat(d) }
-            fingerDraws = UserDefaults.standard.bool(forKey: MetalView.fingerKey)
-            pc_set_finger_draw(handle, fingerDraws ? 1 : 0)
         }
     }
 
@@ -159,20 +162,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private func autoScale() -> Float {
         let size = window?.windowScene?.screen.bounds.size ?? CGSize(width: 834, height: 1194)
         let short = Float(min(size.width, size.height))
-        return max(1.5, min(1.9, 1.55 + (1100 - short) / 1200))
-    }
-
-    /// Larger or smaller interface (⌘⌃= and ⌘⌃−), or back to the automatic size.
-    func adjustUIScale(delta: Float?, reset: Bool) {
-        guard let h = handle else { return }
-        if reset {
-            UserDefaults.standard.removeObject(forKey: MetalView.scaleKey)
-            uiScale = autoScale()
-        } else if let d = delta {
-            uiScale = max(0.8, min(2.4, ((uiScale + d) * 100).rounded() / 100))
-            UserDefaults.standard.set(uiScale, forKey: MetalView.scaleKey)
-        }
-        pc_set_ui_scale(h, uiScale)
+        return max(1.15, min(1.5, 1.15 + (1100 - short) / 1000))
     }
 
     private func pushTheme() {
@@ -187,11 +177,17 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard let h = handle else { return }
         if !suspendFocus && !isFirstResponder { _ = becomeFirstResponder() }
         repeatHeldKey()
+        pruneTouches()
         flushPen(all: false)
         let flags = pc_frame(h)
         let wants = (flags & 2) != 0
-        if wants != softKeyboard {
-            softKeyboard = wants
+        if wants != wantsKeyboard {
+            wantsKeyboard = wants
+            if !wants { keyboardDismissed = false }
+        }
+        let show = wantsKeyboard && !keyboardDismissed
+        if show != softKeyboard {
+            softKeyboard = show
             reloadInputViews()
         }
     }
@@ -218,7 +214,10 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             write_file: { _, path, data, len in
                 guard let path = path, let data = data else { return 0 }
                 let bytes = Data(bytes: data, count: len)
-                return FileAccess.shared.write(path: String(cString: path), data: bytes) ? 1 : 0
+                let name = String(cString: path)
+                let ok = FileAccess.shared.write(path: name, data: bytes)
+                if ok { PhotosExport.shared.finished(path: name) }
+                return ok ? 1 : 0
             },
             open_url: { u, url in
                 guard let v = MetalView.from(u), let url = url else { return }
@@ -266,34 +265,18 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if let path = path { path.withCString { pc_save_dialog_end(h, $0) } } else { pc_save_dialog_end(h, nil) }
     }
 
-    // MARK: Buttons for the on-screen bar
-
-    func undo() { tapKey(0x1D, mods: 8) }          // ⌘Z
-    func redo() { tapKey(0x1D, mods: 8 | 1) }      // ⇧⌘Z
-    func fitOnScreen() { tapKey(0x27, mods: 8) }   // ⌘0
-
-    var fingersDraw: Bool { fingerDraws }
-
-    func setFingersDraw(_ on: Bool) {
-        fingerDraws = on
-        UserDefaults.standard.set(on, forKey: MetalView.fingerKey)
-        if let h = handle { pc_set_finger_draw(h, on ? 1 : 0) }
-    }
-
-    /// Softer (negative) or firmer (positive) Pencil response.
-    func adjustPressure(by step: CGFloat, reset: Bool = false) {
-        if reset { pressureDivisor = 2.5 } else { pressureDivisor = max(1.2, min(4.2, pressureDivisor - step)) }
-        UserDefaults.standard.set(Double(pressureDivisor), forKey: MetalView.pressureKey)
-        pcLog("pencil: full pressure at force \(pressureDivisor)")
-    }
-
     // MARK: Keyboard
 
     override var canBecomeFirstResponder: Bool { true }
     override var inputView: UIView? { softKeyboard ? nil : emptyInput }
 
+    /// The keyboard's own "hide keyboard" key lands here: keep it hidden until the next tap.
     override func resignFirstResponder() -> Bool {
         held = nil
+        if softKeyboard {
+            keyboardDismissed = true
+            softKeyboard = false
+        }
         return super.resignFirstResponder()
     }
 
@@ -518,15 +501,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         pinch.delegate = self
         addGestureRecognizer(pinch)
 
-        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(longPressed(_:)))
-        longPress.minimumPressDuration = 0.55
-        longPress.allowableMovement = 12
-        longPress.numberOfTouchesRequired = 1
-        longPress.allowedTouchTypes = direct
-        longPress.cancelsTouchesInView = false
-        longPress.delegate = self
-        addGestureRecognizer(longPress)
-
         // Two fingers tap: Undo. Three fingers tap: Redo.
         let twoTap = UITapGestureRecognizer(target: self, action: #selector(twoFingerTap(_:)))
         twoTap.numberOfTouchesRequired = 2
@@ -547,6 +521,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     /// Palm rejection: no finger gesture starts while the Pencil is near.
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        // Hovering is how the Pencil is noticed before it touches: never filter it out.
+        if g is UIHoverGestureRecognizer { return true }
         if touch.type == .pencil { return false }
         if touch.type == .direct && pencilNear { return false }
         return true
@@ -606,9 +582,13 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     }
 
     @objc private func twoFingerScroll(_ g: UIPanGestureRecognizer) {
-        guard let h = handle, g.state != .ended, g.state != .cancelled, g.state != .failed else { return }
+        guard let h = handle else { return }
+        if g.state == .ended || g.state == .cancelled { pc_pointer_gone(h); return }
+        guard g.state != .failed else { return }
         let t = g.translation(in: self)
         g.setTranslation(.zero, in: self)
+        let c = g.location(in: self)
+        pc_pointer_moved(h, Float(c.x), Float(c.y))
         if t != .zero { pc_scroll(h, Float(t.x), Float(t.y), 0) }
     }
 
@@ -623,12 +603,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             pc_pointer_gone(h)
         default: break
         }
-    }
-
-    @objc private func longPressed(_ g: UILongPressGestureRecognizer) {
-        guard g.state == .began, fingerTouch != nil, let h = handle else { return }
-        let p = g.location(in: self)
-        pc_long_press(h, Float(p.x), Float(p.y))
     }
 
     @objc private func twoFingerTap(_ g: UITapGestureRecognizer) {
@@ -698,7 +672,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     private func sendPen(_ item: PenItem) {
         guard let h = handle else { return }
-        var pressure = Float(max(0, min(1, item.force / pressureDivisor)))
+        // The Pencil's force (1.0 is an average touch); the Rust side turns it into pressure.
+        var pressure = Float(max(0, min(4.5, item.force)))
         // A little smoothing of the pressure only (never of the position) evens out the response.
         if item.phase == 0 { smoothedPressure = pressure } else { smoothedPressure = smoothedPressure * 0.5 + pressure * 0.5 }
         pressure = smoothedPressure
@@ -709,6 +684,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let h = handle else { return }
+        pruneTouches()
+        keyboardDismissed = false
         let mods = modBits(event?.modifierFlags ?? [])
         for t in touches {
             let p = t.location(in: self)
