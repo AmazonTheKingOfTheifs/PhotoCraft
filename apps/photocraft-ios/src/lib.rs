@@ -176,6 +176,7 @@ thread_local! {
 
 /// How many key presses are written to the log (to find out why a shortcut does nothing).
 static KEY_LOG: AtomicUsize = AtomicUsize::new(0);
+static PEN_LOG: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------------------------
 // Services: what the app asks the iPad to do
@@ -220,7 +221,8 @@ fn build_services(cb: PCCallbacks, inbox: &Inbox, place_inbox: &PlaceInbox) -> S
             // Swift, which writes them the way iPadOS requires.
             let home = std::env::var("HOME").unwrap_or_default();
             let inside = !home.is_empty() && path.starts_with(&home);
-            if !inside && let Some(f) = cb.write_file {
+            let via_swift = !inside || path.contains("/PhotoCraftPhotos-");
+            if via_swift && let Some(f) = cb.write_file {
                 let c = cstring(path);
                 let ok = unsafe { f(cb.user, c.as_ptr(), bytes.as_ptr(), bytes.len()) };
                 note(&format!("wrote {path} through Files ({} bytes): {}", bytes.len(), ok != 0));
@@ -266,6 +268,87 @@ fn build_services(cb: PCCallbacks, inbox: &Inbox, place_inbox: &PlaceInbox) -> S
 // The host: one per window
 // ---------------------------------------------------------------------------------------------
 
+fn touch_settings_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("touch.txt"))
+}
+
+/// Finger drawing on/off and how firmly the Pencil must press, kept between launches.
+fn load_touch_settings() -> (bool, f32) {
+    let mut finger = false;
+    let mut divisor = 2.5_f32;
+    if let Some(text) = touch_settings_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("finger_draws=") {
+                finger = v.trim() == "1";
+            } else if let Some(v) = line.strip_prefix("pressure_divisor=")
+                && let Ok(n) = v.trim().parse::<f32>()
+            {
+                divisor = n.clamp(1.0, 5.0);
+            }
+        }
+    }
+    (finger, divisor)
+}
+
+fn save_touch_settings(finger: bool, divisor: f32) {
+    if let Some(path) = touch_settings_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, format!("finger_draws={}\npressure_divisor={divisor}\n", finger as u8));
+    }
+}
+
+/// Buttons drawn by the host inside the app's own interface.
+#[derive(Clone, Copy)]
+enum TouchAction {
+    Undo,
+    Redo,
+    Delete,
+    ToggleFinger,
+    Softer,
+    Firmer,
+}
+
+/// A small group of big buttons for touch: Undo, Redo, Delete, finger drawing and Pencil
+/// firmness. It sits in the bottom-left corner of the picture area and is part of the app's own
+/// interface (drawn by egui, scaled with it), not a separate window.
+fn touch_strip(ctx: &egui::Context, screen: egui::Rect, canvas: egui::Rect, finger_draws: bool, divisor: f32, out: &mut Vec<TouchAction>) {
+    let left = if canvas.width() > 10.0 { canvas.min.x } else { 0.0 };
+    let bottom = if canvas.height() > 10.0 { canvas.max.y } else { screen.max.y };
+    egui::Area::new(egui::Id::new("photocraft_touch_strip"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(left + 8.0, bottom - screen.max.y - 8.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                let size = [70.0, 40.0];
+                ui.horizontal(|ui| {
+                    if ui.add_sized(size, egui::Button::new("Undo")).clicked() {
+                        out.push(TouchAction::Undo);
+                    }
+                    if ui.add_sized(size, egui::Button::new("Redo")).clicked() {
+                        out.push(TouchAction::Redo);
+                    }
+                    if ui.add_sized(size, egui::Button::new("Delete")).clicked() {
+                        out.push(TouchAction::Delete);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let label = if finger_draws { "Finger: draw" } else { "Finger: pan" };
+                    if ui.add_sized([106.0, 40.0], egui::Button::new(label).selected(finger_draws)).clicked() {
+                        out.push(TouchAction::ToggleFinger);
+                    }
+                    if ui.add_sized([50.0, 40.0], egui::Button::new("Soft")).on_hover_text(format!("Pencil: lighter touch is enough ({divisor:.1})")).clicked() {
+                        out.push(TouchAction::Softer);
+                    }
+                    if ui.add_sized([50.0, 40.0], egui::Button::new("Firm")).on_hover_text(format!("Pencil: needs more pressure ({divisor:.1})")).clicked() {
+                        out.push(TouchAction::Firmer);
+                    }
+                });
+            });
+        });
+}
+
 struct Host {
     app: PhotocraftApp,
     frame: eframe::Frame,
@@ -288,6 +371,8 @@ struct Host {
     wants_keyboard: bool,
     /// Fingers draw on the canvas (otherwise they pan and zoom it, and only the Pencil draws).
     finger_draws: bool,
+    /// The Pencil force that counts as full pressure (1.0 is an average touch). Lower is softer.
+    pressure_divisor: f32,
     /// A finger or Pencil that has not decided yet what it is doing (tap, scroll, drag, draw).
     gesture: Option<Gesture>,
     /// Events held back a few frames (a click's release, the pointer leaving).
@@ -418,7 +503,8 @@ impl Host {
             feed,
             pen_down: false,
             wants_keyboard: false,
-            finger_draws: false,
+            finger_draws: load_touch_settings().0,
+            pressure_divisor: load_touch_settings().1,
             gesture: None,
             posts: Vec::new(),
         })
@@ -488,6 +574,8 @@ impl Host {
     fn gesture_begin(&mut self, x: f32, y: f32, pen: bool) {
         let on_canvas = self.on_canvas(x, y);
         self.gesture = Some(Gesture { start: (x, y), last: (x, y), t0: Instant::now(), mode: GMode::Pending, pen, consumed: false, on_canvas });
+        // Wake up in time to notice a press-and-hold (that opens menus and tool trays).
+        wake_at(&self.deadline, Instant::now() + Duration::from_millis(480));
     }
 
     fn gesture_move(&mut self, x: f32, y: f32) {
@@ -515,6 +603,8 @@ impl Host {
                     // A finger on the picture pans it; a finger dragging up or down on a panel or
                     // menu scrolls it.
                     g.mode = if g.on_canvas { GMode::Pan } else { GMode::Scroll };
+                    let cp = self.pt(x, y);
+                    self.push(egui::Event::PointerMoved(cp));
                     self.wheel(dx, dy);
                 }
             }
@@ -522,7 +612,11 @@ impl Host {
                 let cp = self.pt(x, y);
                 self.push(egui::Event::PointerMoved(cp));
             }
-            GMode::Scroll | GMode::Pan => self.wheel(x - last.0, y - last.1),
+            GMode::Scroll | GMode::Pan => {
+                let cp = self.pt(x, y);
+                self.push(egui::Event::PointerMoved(cp));
+                self.wheel(x - last.0, y - last.1);
+            }
         }
         self.gesture = Some(g);
     }
@@ -545,7 +639,38 @@ impl Host {
                 self.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
                 self.post(1, egui::Event::PointerGone);
             }
-            GMode::Scroll | GMode::Pan => {}
+            GMode::Scroll | GMode::Pan => self.post(1, egui::Event::PointerGone),
+        }
+    }
+
+    /// A shortcut pressed and released, like a key on a keyboard.
+    fn key_tap(&mut self, key: egui::Key, mods: egui::Modifiers) {
+        self.set_modifiers(mods);
+        self.push(egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers: mods });
+        self.post(1, egui::Event::Key { key, physical_key: Some(key), pressed: false, repeat: false, modifiers: mods });
+        self.modifiers = egui::Modifiers::NONE;
+        self.post(1, egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    }
+
+    fn do_action(&mut self, a: TouchAction) {
+        let cmd = to_mods(8);
+        match a {
+            TouchAction::Undo => self.key_tap(egui::Key::Z, cmd),
+            TouchAction::Redo => self.key_tap(egui::Key::Z, to_mods(9)),
+            TouchAction::Delete => self.key_tap(egui::Key::Backspace, egui::Modifiers::NONE),
+            TouchAction::ToggleFinger => {
+                self.finger_draws = !self.finger_draws;
+                self.gesture = None;
+                save_touch_settings(self.finger_draws, self.pressure_divisor);
+            }
+            TouchAction::Softer => {
+                self.pressure_divisor = (self.pressure_divisor - 0.3).max(1.0);
+                save_touch_settings(self.finger_draws, self.pressure_divisor);
+            }
+            TouchAction::Firmer => {
+                self.pressure_divisor = (self.pressure_divisor + 0.3).min(5.0);
+                save_touch_settings(self.finger_draws, self.pressure_divisor);
+            }
         }
     }
 
@@ -592,6 +717,17 @@ impl Host {
         raw.focused = self.focused;
         raw.system_theme = Some(if self.dark { egui::Theme::Dark } else { egui::Theme::Light });
         raw.max_texture_side = Some(self.rs.device.limits().max_texture_dimension_2d as usize);
+        // A press that is held still opens the context menu / tool tray (a right click).
+        if let Some(mut g) = self.gesture
+            && g.mode == GMode::Pending
+            && !g.consumed
+            && g.t0.elapsed() >= Duration::from_millis(450)
+        {
+            g.consumed = true;
+            self.gesture = Some(g);
+            note("press and hold: right click");
+            self.click(g.start.0, g.start.1, egui::PointerButton::Secondary, true);
+        }
         let mut due = Vec::new();
         self.posts.retain_mut(|(n, e)| {
             if *n == 0 {
@@ -616,10 +752,16 @@ impl Host {
         let ctx = self.ctx.clone();
         eframe::App::raw_input_hook(&mut self.app, &ctx, &mut raw);
         // One pass, like eframe itself: the app's logic (shortcuts, typing) runs inside the UI pass.
+        let mut actions: Vec<TouchAction> = Vec::new();
+        let (finger_draws, divisor) = (self.finger_draws, self.pressure_divisor);
         let mut full = ctx.run_ui(raw, |ui| {
             eframe::App::logic(&mut self.app, ui.ctx(), &mut self.frame);
             eframe::App::ui(&mut self.app, ui, &mut self.frame);
+            touch_strip(ui.ctx(), rect, self.app.last_canvas_rect, finger_draws, divisor, &mut actions);
         });
+        for a in actions {
+            self.do_action(a);
+        }
         self.handle_output(&full.platform_output);
         // The on-screen keyboard is wanted only where text can be typed.
         self.wants_keyboard = full.platform_output.ime.is_some();
@@ -857,13 +999,18 @@ pub unsafe extern "C" fn pc_pen(
         h.set_modifiers(to_mods(mods));
         let pos = h.pt(x, y);
         let m = h.modifiers;
+        // The shell sends the Pencil's force (1.0 is an average touch); full pressure is reached
+        // at `pressure_divisor`.
         let sample = PenSample {
-            pressure: pressure.clamp(0.0, 1.0),
+            pressure: (pressure / h.pressure_divisor).clamp(0.0, 1.0),
             tilt_x,
             tilt_y,
             rotation: rotation.rem_euclid(360.0),
             eraser: false,
         };
+        if phase == 0 && PEN_LOG.fetch_add(1, Ordering::Relaxed) < 12 {
+            note(&format!("pen down: force {pressure:.2}, tilt {tilt_x:.0}/{tilt_y:.0}, roll {rotation:.0}"));
+        }
         match phase {
             0 => {
                 if h.on_canvas(x, y) {
