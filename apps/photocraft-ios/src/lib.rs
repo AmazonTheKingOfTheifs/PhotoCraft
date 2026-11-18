@@ -310,43 +310,187 @@ enum TouchAction {
     Firmer,
 }
 
-/// A small group of big buttons for touch: Undo, Redo, Delete, finger drawing and Pencil
-/// firmness. It sits in the bottom-left corner of the picture area and is part of the app's own
-/// interface (drawn by egui, scaled with it), not a separate window.
-fn touch_strip(ctx: &egui::Context, screen: egui::Rect, canvas: egui::Rect, finger_draws: bool, divisor: f32, out: &mut Vec<TouchAction>) {
-    let left = if canvas.width() > 10.0 { canvas.min.x } else { 0.0 };
-    let bottom = if canvas.height() > 10.0 { canvas.max.y } else { screen.max.y };
-    egui::Area::new(egui::Id::new("photocraft_touch_strip"))
+/// State of the touch helpers: the round assist button, its panel, and the held-down keys.
+#[derive(Default)]
+struct TouchUi {
+    /// Where the assist button is (dragged by the person); None until first shown.
+    puck: Option<egui::Pos2>,
+    open: bool,
+    /// Keys held down by touch: Command, Shift, Option, Control.
+    sticky: [bool; 4],
+    /// The spots covered by these helpers, so touches there are never taken for scrolling.
+    rects: Vec<egui::Rect>,
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Undo,
+    Redo,
+    Trash,
+}
+
+/// A square button with a drawn icon (no text, no font needed).
+fn icon_button(ui: &mut egui::Ui, size: f32, icon: Icon) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    let visuals = ui.style().interact(&resp).clone();
+    ui.painter().rect_filled(rect, 8.0, visuals.weak_bg_fill);
+    let color = visuals.fg_stroke.color;
+    let stroke = egui::Stroke::new(2.4, color);
+    let at = |u: f32, v: f32| egui::pos2(rect.min.x + u * size, rect.min.y + v * size);
+    let painter = ui.painter();
+    match icon {
+        Icon::Undo | Icon::Redo => {
+            let mirror = matches!(icon, Icon::Redo);
+            let x = |u: f32| if mirror { 1.0 - u } else { u };
+            // A curve over the top, ending in an arrow head.
+            let (cx, cy, r) = (0.5_f32, 0.56_f32, 0.2_f32);
+            let mut pts = Vec::new();
+            let mut deg = 20.0_f32;
+            while deg >= -200.0 {
+                let t = deg.to_radians();
+                pts.push(at(x(cx + r * t.cos()), cy + r * t.sin()));
+                deg -= 10.0;
+            }
+            painter.add(egui::Shape::line(pts, stroke));
+            let t = (-200.0_f32).to_radians();
+            let end = (cx + r * t.cos(), cy + r * t.sin());
+            let dir = (t.sin(), -t.cos());
+            let dir = if mirror { (-dir.0, dir.1) } else { dir };
+            let end_p = at(x(end.0), end.1);
+            let d = egui::vec2(dir.0, dir.1);
+            let perp = egui::vec2(-d.y, d.x);
+            let tip = end_p + d * (0.13 * size);
+            let b1 = end_p + perp * (0.1 * size);
+            let b2 = end_p - perp * (0.1 * size);
+            painter.add(egui::Shape::convex_polygon(vec![tip, b1, b2], color, egui::Stroke::NONE));
+        }
+        Icon::Trash => {
+            let line = |a: (f32, f32), b: (f32, f32)| painter.line_segment([at(a.0, a.1), at(b.0, b.1)], stroke);
+            line((0.26, 0.30), (0.74, 0.30));
+            line((0.42, 0.30), (0.42, 0.22));
+            line((0.42, 0.22), (0.58, 0.22));
+            line((0.58, 0.22), (0.58, 0.30));
+            line((0.32, 0.30), (0.36, 0.78));
+            line((0.36, 0.78), (0.64, 0.78));
+            line((0.64, 0.78), (0.68, 0.30));
+            line((0.46, 0.42), (0.46, 0.66));
+            line((0.54, 0.42), (0.54, 0.66));
+        }
+    }
+    resp
+}
+
+/// The touch helpers, drawn inside the app's own interface:
+/// - Undo, Redo and Delete as icon buttons in a column near the toolbar, bottom-left of the picture;
+/// - a round assist button (drag it anywhere) that opens Command / Shift / Option / Control to hold
+///   down by touch (any number together), plus finger drawing and Pencil firmness.
+fn touch_ui(
+    ctx: &egui::Context,
+    screen: egui::Rect,
+    canvas: egui::Rect,
+    st: &mut TouchUi,
+    finger_draws: bool,
+    divisor: f32,
+    out: &mut Vec<TouchAction>,
+) {
+    st.rects.clear();
+    let has_canvas = canvas.width() > 10.0 && canvas.height() > 10.0;
+    let (left, right, top, bottom) = if has_canvas {
+        (canvas.min.x, canvas.max.x, canvas.min.y, canvas.max.y)
+    } else {
+        (screen.min.x, screen.max.x, screen.min.y, screen.max.y)
+    };
+
+    let actions = egui::Area::new(egui::Id::new("pc_actions"))
         .order(egui::Order::Foreground)
-        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(left + 8.0, bottom - screen.max.y - 8.0))
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(left + 6.0, bottom - screen.max.y - 6.0))
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                let size = [70.0, 40.0];
-                ui.horizontal(|ui| {
-                    if ui.add_sized(size, egui::Button::new("Undo")).clicked() {
-                        out.push(TouchAction::Undo);
-                    }
-                    if ui.add_sized(size, egui::Button::new("Redo")).clicked() {
-                        out.push(TouchAction::Redo);
-                    }
-                    if ui.add_sized(size, egui::Button::new("Delete")).clicked() {
-                        out.push(TouchAction::Delete);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    let label = if finger_draws { "Finger: draw" } else { "Finger: pan" };
-                    if ui.add_sized([106.0, 40.0], egui::Button::new(label).selected(finger_draws)).clicked() {
-                        out.push(TouchAction::ToggleFinger);
-                    }
-                    if ui.add_sized([50.0, 40.0], egui::Button::new("Soft")).on_hover_text(format!("Pencil: lighter touch is enough ({divisor:.1})")).clicked() {
-                        out.push(TouchAction::Softer);
-                    }
-                    if ui.add_sized([50.0, 40.0], egui::Button::new("Firm")).on_hover_text(format!("Pencil: needs more pressure ({divisor:.1})")).clicked() {
-                        out.push(TouchAction::Firmer);
-                    }
-                });
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+                if icon_button(ui, 44.0, Icon::Undo).clicked() {
+                    out.push(TouchAction::Undo);
+                }
+                if icon_button(ui, 44.0, Icon::Redo).clicked() {
+                    out.push(TouchAction::Redo);
+                }
+                if icon_button(ui, 44.0, Icon::Trash).clicked() {
+                    out.push(TouchAction::Delete);
+                }
             });
         });
+    st.rects.push(actions.response.rect);
+
+    // The round assist button.
+    let size = 56.0_f32;
+    let default = egui::pos2(right - size - 12.0, top + (bottom - top) * 0.62);
+    let mut pos = st.puck.unwrap_or(default);
+    pos.x = pos.x.clamp(screen.min.x, (screen.max.x - size).max(screen.min.x));
+    pos.y = pos.y.clamp(screen.min.y, (screen.max.y - size).max(screen.min.y));
+    let any_down = st.sticky.iter().any(|b| *b);
+    let is_open = st.open;
+    let mut new_pos = pos;
+    let mut toggled = false;
+    let puck = egui::Area::new(egui::Id::new("pc_puck"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
+            let ring = if any_down || is_open { ui.visuals().selection.bg_fill } else { egui::Color32::from_gray(175) };
+            let c = rect.center();
+            ui.painter().circle_filled(c, size / 2.0, egui::Color32::from_black_alpha(150));
+            ui.painter().circle_stroke(c, size / 2.0 - 3.0, egui::Stroke::new(3.0, ring));
+            ui.painter().circle_filled(c, 8.0, ring);
+            if resp.dragged() {
+                new_pos += resp.drag_delta();
+            }
+            if resp.clicked() {
+                toggled = true;
+            }
+        });
+    st.rects.push(puck.response.rect);
+    st.puck = Some(new_pos);
+    if toggled {
+        st.open = !st.open;
+    }
+
+    if st.open {
+        let panel = egui::Area::new(egui::Id::new("pc_puck_panel"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .fixed_pos(egui::pos2(new_pos.x - 8.0, new_pos.y))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (i, label) in ["Cmd", "Shift", "Opt", "Ctrl"].iter().enumerate() {
+                            if ui.add_sized([62.0, 44.0], egui::Button::new(*label).selected(st.sticky[i])).clicked() {
+                                st.sticky[i] = !st.sticky[i];
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let label = if finger_draws { "Finger: draw" } else { "Finger: pan" };
+                        if ui.add_sized([128.0, 44.0], egui::Button::new(label).selected(finger_draws)).clicked() {
+                            out.push(TouchAction::ToggleFinger);
+                        }
+                        if ui
+                            .add_sized([58.0, 44.0], egui::Button::new("Soft"))
+                            .on_hover_text(format!("Pencil: a lighter touch is enough ({divisor:.1})"))
+                            .clicked()
+                        {
+                            out.push(TouchAction::Softer);
+                        }
+                        if ui
+                            .add_sized([58.0, 44.0], egui::Button::new("Firm"))
+                            .on_hover_text(format!("Pencil: needs more pressure ({divisor:.1})"))
+                            .clicked()
+                        {
+                            out.push(TouchAction::Firmer);
+                        }
+                    });
+                });
+            });
+        st.rects.push(panel.response.rect);
+    }
 }
 
 struct Host {
@@ -373,6 +517,13 @@ struct Host {
     finger_draws: bool,
     /// The Pencil force that counts as full pressure (1.0 is an average touch). Lower is softer.
     pressure_divisor: f32,
+    touch: TouchUi,
+    /// Modifier keys as reported by the hardware keyboard (the held-down touch keys are added).
+    hw: egui::Modifiers,
+    /// A fingertip held on the screen while the Pencil draws: keeps Shift down (constrain).
+    touch_shift: bool,
+    /// The mouse cursor the app asked for last frame (resize arrows tell us a handle is there).
+    cursor: egui::CursorIcon,
     /// A finger or Pencil that has not decided yet what it is doing (tap, scroll, drag, draw).
     gesture: Option<Gesture>,
     /// Events held back a few frames (a click's release, the pointer leaving).
@@ -396,6 +547,8 @@ struct Gesture {
     pen: bool,
     consumed: bool,
     on_canvas: bool,
+    /// Started on one of the host's own buttons (assist button, undo column): always a plain click or drag.
+    host_ui: bool,
 }
 
 fn wake_at(deadline: &Arc<Mutex<Option<Instant>>>, at: Instant) {
@@ -503,6 +656,10 @@ impl Host {
             feed,
             pen_down: false,
             wants_keyboard: false,
+            touch: TouchUi::default(),
+            hw: egui::Modifiers::NONE,
+            touch_shift: false,
+            cursor: egui::CursorIcon::Default,
             finger_draws: load_touch_settings().0,
             pressure_divisor: load_touch_settings().1,
             gesture: None,
@@ -519,13 +676,32 @@ impl Host {
         self.wake();
     }
 
+    /// The modifier keys in effect: the hardware keyboard's, plus any held down by touch.
+    fn effective_mods(&self) -> egui::Modifiers {
+        let k = &self.touch.sticky;
+        let cmd = self.hw.command || k[0];
+        egui::Modifiers {
+            alt: self.hw.alt || k[2],
+            ctrl: self.hw.ctrl || k[3],
+            shift: self.hw.shift || k[1] || self.touch_shift,
+            mac_cmd: cmd,
+            command: cmd,
+        }
+    }
+
     /// Tells egui which modifier keys (Shift, Command, ...) are down, whenever that changes.
     /// This egui version learns modifier state only from this event.
-    fn set_modifiers(&mut self, m: egui::Modifiers) {
+    fn refresh_mods(&mut self) {
+        let m = self.effective_mods();
         if m != self.modifiers {
             self.modifiers = m;
             self.push(egui::Event::ModifiersChanged(m));
         }
+    }
+
+    fn set_modifiers(&mut self, hw: egui::Modifiers) {
+        self.hw = hw;
+        self.refresh_mods();
     }
 
     /// Points in the UIKit sense, converted to egui points (the interface size zooms).
@@ -572,8 +748,13 @@ impl Host {
     }
 
     fn gesture_begin(&mut self, x: f32, y: f32, pen: bool) {
-        let on_canvas = self.on_canvas(x, y);
-        self.gesture = Some(Gesture { start: (x, y), last: (x, y), t0: Instant::now(), mode: GMode::Pending, pen, consumed: false, on_canvas });
+        let p = self.pt(x, y);
+        let host_ui = self.touch.rects.iter().any(|r| r.contains(p));
+        let on_canvas = !host_ui && self.on_canvas(x, y);
+        // Let the app see what is under the finger now, so by the time it moves we know if it is
+        // a handle that can be dragged (panel edge, splitter) rather than something to scroll.
+        self.push(egui::Event::PointerMoved(p));
+        self.gesture = Some(Gesture { start: (x, y), last: (x, y), t0: Instant::now(), mode: GMode::Pending, pen, consumed: false, on_canvas, host_ui });
         // Wake up in time to notice a press-and-hold (that opens menus and tool trays).
         wake_at(&self.deadline, Instant::now() + Duration::from_millis(480));
     }
@@ -590,7 +771,15 @@ impl Host {
                     return;
                 }
                 let draws = g.pen || self.finger_draws;
-                let pointer = if g.on_canvas { draws } else { dy.abs() <= dx.abs() * 1.2 };
+                use egui::CursorIcon as C;
+                // The app shows a resize or grab cursor over handles: those are dragged, never scrolled.
+                let handle = matches!(
+                    self.cursor,
+                    C::ResizeHorizontal | C::ResizeVertical | C::ResizeNeSw | C::ResizeNwSe | C::ResizeEast | C::ResizeWest
+                        | C::ResizeNorth | C::ResizeSouth | C::ResizeNorthEast | C::ResizeNorthWest | C::ResizeSouthEast
+                        | C::ResizeSouthWest | C::ResizeColumn | C::ResizeRow | C::Grab | C::Grabbing | C::Move | C::AllScroll
+                );
+                let pointer = if g.host_ui || handle { true } else if g.on_canvas { draws } else { dy.abs() <= dx.abs() * 1.2 };
                 if pointer {
                     g.mode = GMode::Pointer;
                     let sp = self.pt(sx, sy);
@@ -643,13 +832,12 @@ impl Host {
         }
     }
 
-    /// A shortcut pressed and released, like a key on a keyboard.
+    /// A shortcut pressed and released, like a key on a keyboard (exactly these modifiers).
     fn key_tap(&mut self, key: egui::Key, mods: egui::Modifiers) {
         self.set_modifiers(mods);
         self.push(egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers: mods });
         self.post(1, egui::Event::Key { key, physical_key: Some(key), pressed: false, repeat: false, modifiers: mods });
-        self.modifiers = egui::Modifiers::NONE;
-        self.post(1, egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        self.set_modifiers(egui::Modifiers::NONE);
     }
 
     fn do_action(&mut self, a: TouchAction) {
@@ -721,6 +909,7 @@ impl Host {
         if let Some(mut g) = self.gesture
             && g.mode == GMode::Pending
             && !g.consumed
+            && !g.host_ui
             && g.t0.elapsed() >= Duration::from_millis(450)
         {
             g.consumed = true;
@@ -754,11 +943,21 @@ impl Host {
         // One pass, like eframe itself: the app's logic (shortcuts, typing) runs inside the UI pass.
         let mut actions: Vec<TouchAction> = Vec::new();
         let (finger_draws, divisor) = (self.finger_draws, self.pressure_divisor);
+        let touch = &mut self.touch;
         let mut full = ctx.run_ui(raw, |ui| {
+            // Panel edges and splitters get a much wider grab area, so a fingertip can find them.
+            if ui.ctx().style().interaction.resize_grab_radius_side < 14.0 {
+                ui.ctx().style_mut(|s| {
+                    s.interaction.resize_grab_radius_side = 14.0;
+                    s.interaction.resize_grab_radius_corner = 18.0;
+                });
+            }
             eframe::App::logic(&mut self.app, ui.ctx(), &mut self.frame);
             eframe::App::ui(&mut self.app, ui, &mut self.frame);
-            touch_strip(ui.ctx(), rect, self.app.last_canvas_rect, finger_draws, divisor, &mut actions);
+            touch_ui(ui.ctx(), rect, self.app.last_canvas_rect, touch, finger_draws, divisor, &mut actions);
         });
+        self.cursor = full.platform_output.cursor_icon;
+        self.refresh_mods();
         for a in actions {
             self.do_action(a);
         }
@@ -1114,6 +1313,16 @@ pub unsafe extern "C" fn pc_click(h: *mut c_void, x: f32, y: f32, button: c_int,
         h.set_modifiers(to_mods(mods));
         let b = if button == 1 { egui::PointerButton::Secondary } else { egui::PointerButton::Primary };
         h.click(x, y, b, button == 1);
+    }
+}
+
+/// A fingertip rests on the screen while the Pencil draws: keeps Shift down (keeps proportions).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_set_touch_shift(h: *mut c_void, on: c_int) {
+    if let Some(h) = unsafe { host(h) } {
+        h.touch_shift = on != 0;
+        h.refresh_mods();
+        h.wake();
     }
 }
 
