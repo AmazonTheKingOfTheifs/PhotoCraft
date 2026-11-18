@@ -2,7 +2,7 @@ import SwiftUI
 
 extension Notification.Name {
     static let pcAddFonts = Notification.Name("PhotoCraftAddFonts")
-    static let pcUIScale = Notification.Name("PhotoCraftUIScale")
+    static let pcPhotosSaved = Notification.Name("PhotoCraftPhotosSaved")
     static let pcOpenURL = Notification.Name("PhotoCraftOpenURL")
 }
 
@@ -27,20 +27,6 @@ struct PhotoCraftApp: App {
             }
         }
         .commands {
-            CommandMenu("Interface") {
-                Button("Larger Interface") {
-                    NotificationCenter.default.post(name: .pcUIScale, object: nil, userInfo: ["delta": Float(0.1)])
-                }
-                .keyboardShortcut("=", modifiers: [.command, .control])
-                Button("Smaller Interface") {
-                    NotificationCenter.default.post(name: .pcUIScale, object: nil, userInfo: ["delta": Float(-0.1)])
-                }
-                .keyboardShortcut("-", modifiers: [.command, .control])
-                Button("Reset Interface Size") {
-                    NotificationCenter.default.post(name: .pcUIScale, object: nil, userInfo: ["reset": true])
-                }
-                .keyboardShortcut("0", modifiers: [.command, .control])
-            }
             CommandMenu("Fonts") {
                 Button("Add Installed Fonts…") {
                     NotificationCenter.default.post(name: .pcAddFonts, object: nil)
