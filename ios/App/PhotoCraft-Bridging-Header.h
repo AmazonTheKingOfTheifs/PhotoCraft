@@ -29,6 +29,7 @@ void pc_finger(void *h, int phase, float x, float y, uint32_t mods);
 void pc_long_press(void *h, float x, float y);
 void pc_click(void *h, float x, float y, int button, uint32_t mods);
 void pc_set_finger_draw(void *h, int on);
+void pc_set_touch_shift(void *h, int on);
 void pc_scroll(void *h, float dx, float dy, uint32_t mods);
 void pc_zoom(void *h, float factor, float x, float y);
 void pc_key(void *h, uint32_t hid, int pressed, int repeat, uint32_t mods);
