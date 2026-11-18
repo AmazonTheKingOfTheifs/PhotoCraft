@@ -83,6 +83,24 @@ jobs:
           echo "System libraries: $NATIVE"
           echo "NATIVE_LIBS=$NATIVE" >> "$GITHUB_ENV"
 
+      - name: Save interface library sources for reading
+        continue-on-error: true
+        run: |
+          mkdir -p logs/ui-libs
+          for d in $(ls -d $HOME/.cargo/git/checkouts/craft-*/*/ 2>/dev/null); do
+            name=$(basename $(dirname $d))
+            ls "$d" > "logs/ui-libs/$name-contents.txt" 2>&1
+            for c in $(find "$d" -maxdepth 2 -type d -name 'craft-ui*' 2>/dev/null | head -3); do
+              tar czf "logs/ui-libs/$name-$(basename $c).tgz" -C "$(dirname $c)" "$(basename $c)" --exclude='*/target/*' 2>/dev/null
+            done
+          done
+          for pattern in 'toolbar*.rs' 'tool_tray*.rs' 'tools_panel*.rs' 'workspace*.rs' 'dock*.rs' 'panel_docking.rs' 'options_bar*.rs' 'context_bar*.rs' 'menu_catalog.rs' 'tool_catalog*.rs' 'left_*.rs' 'right_*.rs'; do
+            for f in $(find crates -name "$pattern" -not -path '*/target/*' 2>/dev/null | head -6); do
+              if [ "$(wc -c < "$f")" -lt 400000 ]; then cp "$f" "logs/upstream/$(echo $f | tr / _).txt"; fi
+            done
+          done
+          ls -la logs/ui-libs logs/upstream | head -120
+
       - name: Make the app icon
         run: |
           ICONSET=ios/App/Assets.xcassets/AppIcon.appiconset
