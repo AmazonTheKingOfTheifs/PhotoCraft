@@ -67,6 +67,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     private var ignoredTouches = Set<UITouch>()
     private var fingerTouch: UITouch?
     private var fingerLast = CGPoint.zero
+    /// A fingertip resting on the screen while the Pencil draws: holds Shift (keeps proportions).
+    private var constrainTouch: UITouch?
 
     /// True while the Pencil is touching, hovering, or has only just left the screen.
     private var pencilNear: Bool {
@@ -82,6 +84,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         directTouches = directTouches.filter { $0.phase != .ended && $0.phase != .cancelled }
         ignoredTouches = ignoredTouches.filter { $0.phase != .ended && $0.phase != .cancelled }
         if let f = fingerTouch, f.phase == .ended || f.phase == .cancelled { cancelFinger() }
+        if let c = constrainTouch, c.phase == .ended || c.phase == .cancelled { releaseConstrain() }
     }
 
     // UITextInputTraits (no autocorrect while typing)
@@ -617,6 +620,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     // MARK: Pencil, pointer and finger touches
 
+    private func releaseConstrain() {
+        constrainTouch = nil
+        if let h = handle { pc_set_touch_shift(h, 0) }
+    }
+
     /// Drops a finger that was acting as the pointer (a second finger or the Pencil arrived).
     private func cancelFinger() {
         if fingerTouch != nil, let h = handle {
@@ -664,7 +672,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     private func flushPen(all: Bool) {
         let now = CACurrentMediaTime()
-        while let first = penQueue.first, first.ready || all || now - first.time > 0.05 {
+        // A sample waits at most about one frame for its refined pressure: the ink keeps up with the tip.
+        while let first = penQueue.first, first.ready || all || now - first.time > 0.012 {
             penQueue.removeFirst()
             sendPen(first)
         }
@@ -704,6 +713,13 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 pc_pointer_moved(h, Float(p.x), Float(p.y))
                 pc_pointer_button(h, Float(p.x), Float(p.y), pointerButton, 1, mods)
             default:
+                // One fingertip (not a palm) on the screen while the Pencil is drawing or
+                // resizing: keeps the proportions, like holding Shift.
+                if pencilTouch != nil && constrainTouch == nil && t.majorRadius < 20 {
+                    constrainTouch = t
+                    pc_set_touch_shift(h, 1)
+                    continue
+                }
                 if pencilNear {
                     ignoredTouches.insert(t)
                     continue
@@ -755,6 +771,10 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             case .indirectPointer:
                 pc_pointer_button(h, Float(p.x), Float(p.y), pointerButton, 0, mods)
             default:
+                if t === constrainTouch {
+                    releaseConstrain()
+                    continue
+                }
                 directTouches.remove(t)
                 guard t === fingerTouch else { continue }
                 pc_finger(h, cancelled ? 3 : 2, Float(p.x), Float(p.y), mods)
