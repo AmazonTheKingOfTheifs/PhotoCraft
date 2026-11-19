@@ -946,8 +946,10 @@ impl Host {
         let touch = &mut self.touch;
         let mut full = ctx.run_ui(raw, |ui| {
             // Panel edges and splitters get a much wider grab area, so a fingertip can find them.
-            if ui.ctx().style().interaction.resize_grab_radius_side < 14.0 {
-                ui.ctx().style_mut(|s| {
+            let style_ctx = ui.ctx().clone();
+            let theme = style_ctx.theme();
+            if style_ctx.style_of(theme).interaction.resize_grab_radius_side < 14.0 {
+                style_ctx.style_mut_of(theme, |s| {
                     s.interaction.resize_grab_radius_side = 14.0;
                     s.interaction.resize_grab_radius_corner = 18.0;
                 });
