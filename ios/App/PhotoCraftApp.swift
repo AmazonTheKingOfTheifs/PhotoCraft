@@ -9,9 +9,14 @@ extension Notification.Name {
 @main
 struct PhotoCraftApp: App {
     init() {
+        // The app sizes its memory budgets from the machine's RAM, which iPadOS does not report to
+        // it. Telling it about half of the real memory keeps big canvases under the system's limit.
+        let halfMB = ProcessInfo.processInfo.physicalMemory / 2 / 1_048_576
+        setenv("PHOTOCRAFT_RAM_MB", String(halfMB), 1)
         // Before any window exists, so PhotoCraft finds the iPad's fonts when it starts.
         SystemFonts.prepare()
         let info = Bundle.main.infoDictionary
+        pcLog("memory budget based on \(halfMB) MB")
         pcLog("PhotoCraft version \(info?["CFBundleShortVersionString"] ?? "?") (build \(info?["CFBundleVersion"] ?? "?"))")
         // Reopen access to the files you used recently, so Recent files still open.
         FileAccess.shared.restore()
