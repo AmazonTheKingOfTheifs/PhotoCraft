@@ -296,21 +296,43 @@ fn save_pressure_divisor(divisor: f32) {
     }
 }
 
-/// Turns on the app's canvas twist (two-finger rotate) the first time, without ever overriding a
-/// choice made in Preferences: the setting is only added while it is missing from the file.
+/// Turns on the app's canvas twist (two-finger rotate) unless the preferences already say
+/// something about it, so a choice made in Preferences is never overridden. Plain text editing:
+/// if the file does not look the way this expects, it is returned unchanged.
 fn with_touch_defaults(text: Option<String>) -> String {
-    let mut v: serde_json::Value =
-        text.as_deref().and_then(|t| serde_json::from_str(t).ok()).unwrap_or_else(|| serde_json::json!({}));
-    if !v.is_object() {
-        v = serde_json::json!({});
+    const ON: &str = "\"rotateViewWithTrackpad\":true";
+    let Some(t) = text.filter(|t| !t.trim().is_empty()) else {
+        return format!("{{\"enhancedControls\":{{{ON}}}}}");
+    };
+    if t.contains("rotateViewWithTrackpad") {
+        return t;
     }
-    if let Some(obj) = v.as_object_mut() {
-        let ec = obj.entry("enhancedControls").or_insert_with(|| serde_json::json!({}));
-        if let Some(ec) = ec.as_object_mut() {
-            ec.entry("rotateViewWithTrackpad").or_insert(serde_json::Value::Bool(true));
+    // Inserts `what` just after the first `{` that follows `from`, with a comma when the object
+    // already has something in it.
+    fn insert_after_brace(t: &str, from: usize, what: &str) -> Option<String> {
+        let open = from + t[from..].find('{')?;
+        let rest = &t[open + 1..];
+        let empty = rest.trim_start().starts_with('}');
+        let comma = if empty { "" } else { "," };
+        Some(format!("{}{}{}{}", &t[..open + 1], what, comma, rest))
+    }
+    if let Some(key) = t.find("\"enhancedControls\"") {
+        // The object must start right after the key (`: {`).
+        let after = &t[key + "\"enhancedControls\"".len()..];
+        if after.trim_start().starts_with(':') && after.trim_start()[1..].trim_start().starts_with('{') {
+            if let Some(out) = insert_after_brace(&t, key, ON) {
+                return out;
+            }
+        }
+        return t;
+    }
+    if t.trim_start().starts_with('{') {
+        let what = format!("\"enhancedControls\":{{{ON}}}");
+        if let Some(out) = insert_after_brace(&t, 0, &what) {
+            return out;
         }
     }
-    v.to_string()
+    t
 }
 
 /// Buttons drawn by the host inside the app's own interface.
