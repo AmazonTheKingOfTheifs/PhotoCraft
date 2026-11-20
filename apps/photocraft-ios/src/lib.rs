@@ -249,7 +249,7 @@ fn build_services(cb: PCCallbacks, inbox: &Inbox, place_inbox: &PlaceInbox) -> S
         })),
         inbox: Some(inbox.clone()),
         place_inbox: Some(place_inbox.clone()),
-        load_prefs: Some(Box::new(|| prefs_path().and_then(|p| std::fs::read_to_string(p).ok()))),
+        load_prefs: Some(Box::new(|| Some(with_touch_defaults(prefs_path().and_then(|p| std::fs::read_to_string(p).ok()))))),
         save_prefs: Some(Box::new(|text: &str| {
             let Some(path) = prefs_path() else { return Err("no preferences folder".to_string()) };
             if let Some(parent) = path.parent() {
@@ -272,31 +272,45 @@ fn touch_settings_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("touch.txt"))
 }
 
-/// Finger drawing on/off and how firmly the Pencil must press, kept between launches.
-fn load_touch_settings() -> (bool, f32) {
-    let mut finger = false;
+/// How firmly the Pencil must press for full pressure, kept between launches.
+fn load_pressure_divisor() -> f32 {
     let mut divisor = 2.5_f32;
     if let Some(text) = touch_settings_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         for line in text.lines() {
-            if let Some(v) = line.strip_prefix("finger_draws=") {
-                finger = v.trim() == "1";
-            } else if let Some(v) = line.strip_prefix("pressure_divisor=")
+            if let Some(v) = line.strip_prefix("pressure_divisor=")
                 && let Ok(n) = v.trim().parse::<f32>()
             {
                 divisor = n.clamp(1.0, 5.0);
             }
         }
     }
-    (finger, divisor)
+    divisor
 }
 
-fn save_touch_settings(finger: bool, divisor: f32) {
+fn save_pressure_divisor(divisor: f32) {
     if let Some(path) = touch_settings_path() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(path, format!("finger_draws={}\npressure_divisor={divisor}\n", finger as u8));
+        let _ = std::fs::write(path, format!("pressure_divisor={divisor}\n"));
     }
+}
+
+/// Turns on the app's canvas twist (two-finger rotate) the first time, without ever overriding a
+/// choice made in Preferences: the setting is only added while it is missing from the file.
+fn with_touch_defaults(text: Option<String>) -> String {
+    let mut v: serde_json::Value =
+        text.as_deref().and_then(|t| serde_json::from_str(t).ok()).unwrap_or_else(|| serde_json::json!({}));
+    if !v.is_object() {
+        v = serde_json::json!({});
+    }
+    if let Some(obj) = v.as_object_mut() {
+        let ec = obj.entry("enhancedControls").or_insert_with(|| serde_json::json!({}));
+        if let Some(ec) = ec.as_object_mut() {
+            ec.entry("rotateViewWithTrackpad").or_insert(serde_json::Value::Bool(true));
+        }
+    }
+    v.to_string()
 }
 
 /// Buttons drawn by the host inside the app's own interface.
@@ -305,7 +319,6 @@ enum TouchAction {
     Undo,
     Redo,
     Delete,
-    ToggleFinger,
     Softer,
     Firmer,
 }
@@ -389,7 +402,6 @@ fn touch_ui(
     screen: egui::Rect,
     canvas: egui::Rect,
     st: &mut TouchUi,
-    finger_draws: bool,
     divisor: f32,
     out: &mut Vec<TouchAction>,
 ) {
@@ -468,10 +480,7 @@ fn touch_ui(
                         }
                     });
                     ui.horizontal(|ui| {
-                        let label = if finger_draws { "Finger: draw" } else { "Finger: pan" };
-                        if ui.add_sized([128.0, 44.0], egui::Button::new(label).selected(finger_draws)).clicked() {
-                            out.push(TouchAction::ToggleFinger);
-                        }
+                        ui.label(format!("Pencil pressure {divisor:.1}"));
                         if ui
                             .add_sized([58.0, 44.0], egui::Button::new("Soft"))
                             .on_hover_text(format!("Pencil: a lighter touch is enough ({divisor:.1})"))
@@ -513,8 +522,6 @@ struct Host {
     feed: StylusFeed,
     pen_down: bool,
     wants_keyboard: bool,
-    /// Fingers draw on the canvas (otherwise they pan and zoom it, and only the Pencil draws).
-    finger_draws: bool,
     /// The Pencil force that counts as full pressure (1.0 is an average touch). Lower is softer.
     pressure_divisor: f32,
     touch: TouchUi,
@@ -549,6 +556,11 @@ struct Gesture {
     on_canvas: bool,
     /// Started on one of the host's own buttons (assist button, undo column): always a plain click or drag.
     host_ui: bool,
+    /// A drag on a panel or menu that is pressed like a mouse but turns into scrolling if the app
+    /// does not pick it up as a drag of anything (a slider, a splitter).
+    adaptive: bool,
+    /// When the press started (for the adaptive check).
+    since: Instant,
 }
 
 fn wake_at(deadline: &Arc<Mutex<Option<Instant>>>, at: Instant) {
@@ -660,8 +672,7 @@ impl Host {
             hw: egui::Modifiers::NONE,
             touch_shift: false,
             cursor: egui::CursorIcon::Default,
-            finger_draws: load_touch_settings().0,
-            pressure_divisor: load_touch_settings().1,
+            pressure_divisor: load_pressure_divisor(),
             gesture: None,
             posts: Vec::new(),
         })
@@ -754,7 +765,7 @@ impl Host {
         // Let the app see what is under the finger now, so by the time it moves we know if it is
         // a handle that can be dragged (panel edge, splitter) rather than something to scroll.
         self.push(egui::Event::PointerMoved(p));
-        self.gesture = Some(Gesture { start: (x, y), last: (x, y), t0: Instant::now(), mode: GMode::Pending, pen, consumed: false, on_canvas, host_ui });
+        self.gesture = Some(Gesture { start: (x, y), last: (x, y), t0: Instant::now(), mode: GMode::Pending, pen, consumed: false, on_canvas, host_ui, adaptive: false, since: Instant::now() });
         // Wake up in time to notice a press-and-hold (that opens menus and tool trays).
         wake_at(&self.deadline, Instant::now() + Duration::from_millis(480));
     }
@@ -767,10 +778,11 @@ impl Host {
             GMode::Pending => {
                 let (sx, sy) = g.start;
                 let (dx, dy) = (x - sx, y - sy);
-                if dx * dx + dy * dy <= 64.0 {
+                // A little drag is needed first: panels, bars and menus never scroll the moment they are touched.
+                let slop2 = if g.on_canvas || g.host_ui { 64.0 } else { 144.0 };
+                if dx * dx + dy * dy <= slop2 {
                     return;
                 }
-                let draws = g.pen || self.finger_draws;
                 use egui::CursorIcon as C;
                 // The app shows a resize or grab cursor over handles: those are dragged, never scrolled.
                 let handle = matches!(
@@ -779,9 +791,12 @@ impl Host {
                         | C::ResizeNorth | C::ResizeSouth | C::ResizeNorthEast | C::ResizeNorthWest | C::ResizeSouthEast
                         | C::ResizeSouthWest | C::ResizeColumn | C::ResizeRow | C::Grab | C::Grabbing | C::Move | C::AllScroll
                 );
-                let pointer = if g.host_ui || handle { true } else if g.on_canvas { draws } else { dy.abs() <= dx.abs() * 1.2 };
+                // Fingers never draw: on the picture a finger only pans. The Pencil draws elsewhere.
+                let pointer = if g.host_ui || handle { true } else if g.on_canvas { false } else { dy.abs() <= dx.abs() * 1.2 };
                 if pointer {
                     g.mode = GMode::Pointer;
+                    g.since = Instant::now();
+                    g.adaptive = !g.host_ui && !handle && !g.on_canvas;
                     let sp = self.pt(sx, sy);
                     let cp = self.pt(x, y);
                     let m = self.modifiers;
@@ -814,11 +829,10 @@ impl Host {
         let Some(g) = self.gesture.take() else { return };
         match g.mode {
             GMode::Pending => {
-                let draws = g.pen || self.finger_draws;
                 let quick = g.t0.elapsed() < Duration::from_millis(500);
-                // A quick tap clicks. A tap on the picture with a finger does nothing, unless
-                // fingers are set to draw.
-                if !cancelled && !g.consumed && quick && !(g.on_canvas && !draws) {
+                // A quick tap clicks. A tap on the picture with a finger does nothing: fingers
+                // never select, move or deselect on the canvas.
+                if !cancelled && !g.consumed && quick && !(g.on_canvas && !g.pen) {
                     self.click(g.start.0, g.start.1, egui::PointerButton::Primary, false);
                 }
             }
@@ -846,18 +860,13 @@ impl Host {
             TouchAction::Undo => self.key_tap(egui::Key::Z, cmd),
             TouchAction::Redo => self.key_tap(egui::Key::Z, to_mods(9)),
             TouchAction::Delete => self.key_tap(egui::Key::Backspace, egui::Modifiers::NONE),
-            TouchAction::ToggleFinger => {
-                self.finger_draws = !self.finger_draws;
-                self.gesture = None;
-                save_touch_settings(self.finger_draws, self.pressure_divisor);
-            }
             TouchAction::Softer => {
                 self.pressure_divisor = (self.pressure_divisor - 0.3).max(1.0);
-                save_touch_settings(self.finger_draws, self.pressure_divisor);
+                save_pressure_divisor(self.pressure_divisor);
             }
             TouchAction::Firmer => {
                 self.pressure_divisor = (self.pressure_divisor + 0.3).min(5.0);
-                save_touch_settings(self.finger_draws, self.pressure_divisor);
+                save_pressure_divisor(self.pressure_divisor);
             }
         }
     }
@@ -942,7 +951,7 @@ impl Host {
         eframe::App::raw_input_hook(&mut self.app, &ctx, &mut raw);
         // One pass, like eframe itself: the app's logic (shortcuts, typing) runs inside the UI pass.
         let mut actions: Vec<TouchAction> = Vec::new();
-        let (finger_draws, divisor) = (self.finger_draws, self.pressure_divisor);
+        let divisor = self.pressure_divisor;
         let touch = &mut self.touch;
         let mut full = ctx.run_ui(raw, |ui| {
             // Panel edges and splitters get a much wider grab area, so a fingertip can find them.
@@ -956,9 +965,24 @@ impl Host {
             }
             eframe::App::logic(&mut self.app, ui.ctx(), &mut self.frame);
             eframe::App::ui(&mut self.app, ui, &mut self.frame);
-            touch_ui(ui.ctx(), rect, self.app.last_canvas_rect, touch, finger_draws, divisor, &mut actions);
+            touch_ui(ui.ctx(), rect, self.app.last_canvas_rect, touch, divisor, &mut actions);
         });
         self.cursor = full.platform_output.cursor_icon;
+        // A drag on a panel, bar or menu that the app did not take as a drag of anything (not a
+        // slider, not a splitter) becomes scrolling: the press is released and the finger scrolls.
+        if let Some(mut g) = self.gesture
+            && g.mode == GMode::Pointer
+            && g.adaptive
+            && g.since.elapsed() >= Duration::from_millis(70)
+            && ctx.dragged_id().is_none()
+        {
+            let pos = self.pt(g.last.0, g.last.1);
+            let m = self.modifiers;
+            self.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
+            g.mode = GMode::Scroll;
+            g.adaptive = false;
+            self.gesture = Some(g);
+        }
         self.refresh_mods();
         for a in actions {
             self.do_action(a);
@@ -1328,11 +1352,17 @@ pub unsafe extern "C" fn pc_set_touch_shift(h: *mut c_void, on: c_int) {
     }
 }
 
-/// Fingers draw (1) or only pan and zoom the picture (0).
+/// Two-finger twist: turns the canvas view (the app's own "Rotate View with trackpad" setting).
+/// `radians` is positive for counter-clockwise, like a Mac trackpad.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pc_set_finger_draw(h: *mut c_void, on: c_int) {
+pub unsafe extern "C" fn pc_rotate(h: *mut c_void, radians: f32, x: f32, y: f32) {
     if let Some(h) = unsafe { host(h) } {
-        h.finger_draws = on != 0;
+        if !radians.is_finite() || radians == 0.0 {
+            return;
+        }
+        let p = h.pt(x, y);
+        h.push(egui::Event::PointerMoved(p));
+        h.push(egui::Event::Rotate(radians));
     }
 }
 
