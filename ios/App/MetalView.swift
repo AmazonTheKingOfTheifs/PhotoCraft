@@ -8,6 +8,12 @@ import QuartzCore
 /// (and for a moment after), finger touches are ignored completely.
 final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencilInteractionDelegate {
 
+    // Stored state for the on-screen keyboard's text-cursor gestures (see VirtualTextInput.swift).
+    weak var inputDelegate: UITextInputDelegate?
+    var markedTextStyle: [NSAttributedString.Key: Any]?
+    let vt = VirtualText()
+    lazy var vtTokenizer: UITextInputTokenizer = UITextInputStringTokenizer(textInput: self)
+
     override class var layerClass: AnyClass { CAMetalLayer.self }
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
 
@@ -19,7 +25,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     /// True while a picker or alert is showing, so the view doesn't grab the keyboard back.
     var suspendFocus = false
 
-    private var handle: UnsafeMutableRawPointer?
+    var handle: UnsafeMutableRawPointer?
     private var startFailed = false
     private var link: CADisplayLink?
     private var softKeyboard = false
@@ -57,6 +63,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         var index: NSNumber?
         var ready: Bool
         var time: CFTimeInterval
+        var stamp: TimeInterval
     }
     private var penQueue: [PenItem] = []
     private var smoothedPressure: Float = 0
@@ -287,6 +294,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     func insertText(_ text: String) {
         guard let h = handle else { return }
+        vt.marked = nil
+        vt.advance(by: text == "\n" ? 0 : text.count)
         if text == "\n" {
             pc_key(h, 0x28, 1, 0, 0)
             pc_key(h, 0x28, 0, 0, 0)
@@ -297,6 +306,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     func deleteBackward() {
         guard let h = handle else { return }
+        vt.advance(by: -1)
         pc_key(h, 0x2A, 1, 0, 0)
         pc_key(h, 0x2A, 0, 0, 0)
     }
@@ -451,7 +461,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     }
 
     /// A key press and release, like a shortcut typed on a keyboard.
-    private func tapKey(_ hid: UInt32, mods: UInt32 = 0) {
+    func tapKey(_ hid: UInt32, mods: UInt32 = 0) {
         guard let h = handle else { return }
         pc_key(h, hid, 1, 0, mods)
         pc_key(h, hid, 0, 0, mods)
@@ -503,6 +513,12 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         pinch.cancelsTouchesInView = false
         pinch.delegate = self
         addGestureRecognizer(pinch)
+
+        let twist = UIRotationGestureRecognizer(target: self, action: #selector(twisted(_:)))
+        twist.allowedTouchTypes = direct
+        twist.cancelsTouchesInView = false
+        twist.delegate = self
+        addGestureRecognizer(twist)
 
         // Two fingers tap: Undo. Three fingers tap: Redo.
         let twoTap = UITapGestureRecognizer(target: self, action: #selector(twoFingerTap(_:)))
@@ -595,11 +611,47 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if t != .zero { pc_scroll(h, Float(t.x), Float(t.y), 0) }
     }
 
+    private var pinchTotal: CGFloat = 1
+    private var twistEngaged = false
+    private var twistSent: CGFloat = 0
+
+    /// Two-finger twist turns the canvas view only. It starts after a small twist (a bigger one
+    /// while the fingers are clearly pinching), so zooming does not turn the picture by accident.
+    @objc private func twisted(_ g: UIRotationGestureRecognizer) {
+        guard let h = handle else { return }
+        switch g.state {
+        case .began:
+            twistEngaged = false
+            twistSent = 0
+        case .changed:
+            let total = g.rotation   // radians since the twist began, clockwise is positive
+            if !twistEngaged {
+                let degrees = abs(total) * 180 / CGFloat.pi
+                let pinching = abs(log(Double(max(pinchTotal, 0.01)))) > 0.12
+                if degrees < (pinching ? 12 : 4) { return }
+                twistEngaged = true
+                twistSent = total
+                return
+            }
+            let delta = total - twistSent
+            twistSent = total
+            let p = g.location(in: self)
+            // The app takes counter-clockwise as positive, like a Mac trackpad.
+            pc_rotate(h, Float(-delta), Float(p.x), Float(p.y))
+        case .ended, .cancelled:
+            twistEngaged = false
+        default: break
+        }
+    }
+
     @objc private func pinched(_ g: UIPinchGestureRecognizer) {
         guard let h = handle else { return }
         switch g.state {
+        case .began:
+            pinchTotal = 1
         case .changed:
             let p = g.location(in: self)
+            pinchTotal *= g.scale
             pc_zoom(h, Float(g.scale), Float(p.x), Float(p.y))
             g.scale = 1
         case .ended, .cancelled:
@@ -652,7 +704,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 mods: mods,
                 index: waiting ? c.estimationUpdateIndex : nil,
                 ready: !waiting,
-                time: CACurrentMediaTime()))
+                time: CACurrentMediaTime(),
+                stamp: c.timestamp))
         }
         flushPen(all: false)
     }
@@ -672,23 +725,129 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     private func flushPen(all: Bool) {
         let now = CACurrentMediaTime()
-        // A sample waits at most about one frame for its refined pressure: the ink keeps up with the tip.
-        while let first = penQueue.first, first.ready || all || now - first.time > 0.012 {
+        // A sample waits at most a few milliseconds for its refined pressure: the ink keeps up with the tip.
+        while let first = penQueue.first, first.ready || all || now - first.time > 0.006 {
             penQueue.removeFirst()
             sendPen(first)
         }
     }
 
+    // MARK: Smooth curve through the Pencil samples
+
+    private struct PenPoint {
+        var x: Double
+        var y: Double
+        var pressure: Float
+        var tiltX: Float
+        var tiltY: Float
+        var roll: Float
+    }
+
+    /// The last few real samples. Each new sample lets the curve between the two before it be drawn smoothly.
+    private var fit: [PenPoint] = []
+    private var statSum = 0.0
+    private var statMax = 0.0
+    private var statCount = 0
+
     private func sendPen(_ item: PenItem) {
-        guard let h = handle else { return }
+        guard handle != nil else { return }
         // The Pencil's force (1.0 is an average touch); the Rust side turns it into pressure.
         var pressure = Float(max(0, min(4.5, item.force)))
         // A little smoothing of the pressure only (never of the position) evens out the response.
         if item.phase == 0 { smoothedPressure = pressure } else { smoothedPressure = smoothedPressure * 0.5 + pressure * 0.5 }
         pressure = smoothedPressure
         let (tx, ty) = MetalView.tilt(altitude: Double(item.altitude), azimuth: item.azimuth)
-        pc_pen(h, Float(item.location.x), Float(item.location.y), item.phase, pressure, tx, ty,
-               Float(item.roll * 180 / CGFloat.pi), item.mods)
+        let point = PenPoint(x: Double(item.location.x), y: Double(item.location.y), pressure: pressure, tiltX: tx, tiltY: ty,
+                             roll: Float(item.roll * 180 / CGFloat.pi))
+
+        // How late the sample reaches the app, measured from the moment of the touch.
+        let delay = (ProcessInfo.processInfo.systemUptime - item.stamp) * 1000
+        statSum += delay
+        statMax = max(statMax, delay)
+        statCount += 1
+        if statCount >= 240 {
+            pcLog(String(format: "pencil: shell delay average %.1f ms, worst %.1f ms (240 samples)", statSum / Double(statCount), statMax))
+            statSum = 0; statMax = 0; statCount = 0
+        }
+
+        switch item.phase {
+        case 0:
+            fit = [point]
+            emitPen(point, phase: 0, mods: item.mods)
+        case 1:
+            fit.append(point)
+            if fit.count > 4 { fit.removeFirst() }
+            // With a new sample in hand, the curve between the two samples before it is final.
+            if fit.count >= 3 {
+                let n = fit.count
+                let p1 = fit[n - 3], p2 = fit[n - 2]
+                let p0 = n >= 4 ? fit[n - 4] : nil
+                emitSegment(p0, p1, p2, fit[n - 1], mods: item.mods)
+                emitPen(p2, phase: 1, mods: item.mods)
+            }
+        default:
+            // The stroke ends: finish the curve up to the last sample, then lift.
+            fit.append(point)
+            if fit.count > 4 { fit.removeFirst() }
+            let n = fit.count
+            if n >= 3 {
+                let p0 = n >= 4 ? fit[n - 4] : nil
+                emitSegment(p0, fit[n - 3], fit[n - 2], fit[n - 1], mods: item.mods)
+                emitPen(fit[n - 2], phase: 1, mods: item.mods)
+            }
+            if n >= 2 {
+                let p0 = n >= 3 ? fit[n - 3] : nil
+                emitSegment(p0, fit[n - 2], fit[n - 1], nil, mods: item.mods)
+            }
+            emitPen(point, phase: item.phase, mods: item.mods)
+            fit.removeAll()
+        }
+    }
+
+    private func emitPen(_ p: PenPoint, phase: Int32, mods: UInt32) {
+        guard let h = handle else { return }
+        pc_pen(h, Float(p.x), Float(p.y), phase, p.pressure, p.tiltX, p.tiltY, p.roll, mods)
+    }
+
+    /// Extra points along a smooth (centripetal Catmull-Rom) curve from `p1` to `p2`, so a fast
+    /// stroke is drawn as a curve rather than as straight chords. `p0` and `p3` are the
+    /// neighbouring samples; a missing neighbour is mirrored.
+    private func emitSegment(_ p0: PenPoint?, _ p1: PenPoint, _ p2: PenPoint, _ p3: PenPoint?, mods: UInt32) {
+        let dx = p2.x - p1.x, dy = p2.y - p1.y
+        let length = (dx * dx + dy * dy).squareRoot()
+        if length < 2.0 { return }
+        let count = min(12, Int((length / 2.0).rounded(.up)) - 1)
+        if count < 1 { return }
+        let a = p0 ?? PenPoint(x: 2 * p1.x - p2.x, y: 2 * p1.y - p2.y, pressure: p1.pressure, tiltX: p1.tiltX, tiltY: p1.tiltY, roll: p1.roll)
+        let d = p3 ?? PenPoint(x: 2 * p2.x - p1.x, y: 2 * p2.y - p1.y, pressure: p2.pressure, tiltX: p2.tiltX, tiltY: p2.tiltY, roll: p2.roll)
+        func dist(_ u: PenPoint, _ v: PenPoint) -> Double { max(((u.x - v.x) * (u.x - v.x) + (u.y - v.y) * (u.y - v.y)).squareRoot().squareRoot(), 1e-6) }
+        let t0 = 0.0
+        let t1 = t0 + dist(a, p1)
+        let t2 = t1 + dist(p1, p2)
+        let t3 = t2 + dist(p2, d)
+        func mix(_ u: (Double, Double), _ v: (Double, Double), _ w: Double) -> (Double, Double) {
+            (u.0 * (1 - w) + v.0 * w, u.1 * (1 - w) + v.1 * w)
+        }
+        var rollDelta = p2.roll - p1.roll
+        if rollDelta > 180 { rollDelta -= 360 } else if rollDelta < -180 { rollDelta += 360 }
+        for i in 1...count {
+            let u = Double(i) / Double(count + 1)
+            let t = t1 + (t2 - t1) * u
+            let A1 = mix((a.x, a.y), (p1.x, p1.y), (t - t0) / (t1 - t0))
+            let A2 = mix((p1.x, p1.y), (p2.x, p2.y), (t - t1) / (t2 - t1))
+            let A3 = mix((p2.x, p2.y), (d.x, d.y), (t - t2) / (t3 - t2))
+            let B1 = mix(A1, A2, (t - t0) / (t2 - t0))
+            let B2 = mix(A2, A3, (t - t1) / (t3 - t1))
+            let C = mix(B1, B2, (t - t1) / (t2 - t1))
+            if !C.0.isFinite || !C.1.isFinite { continue }
+            let f = Float(u)
+            let mid = PenPoint(x: C.0, y: C.1,
+                               pressure: p1.pressure + (p2.pressure - p1.pressure) * f,
+                               tiltX: p1.tiltX + (p2.tiltX - p1.tiltX) * f,
+                               tiltY: p1.tiltY + (p2.tiltY - p1.tiltY) * f,
+                               roll: p1.roll + rollDelta * f)
+            emitPen(mid, phase: 1, mods: mods)
+        }
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
